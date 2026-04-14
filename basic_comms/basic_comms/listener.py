@@ -28,3 +28,6 @@ def main(args=None):
         if rclpy.ok():
             rclpy.shutdown()
         minimal_subscriber.destroy_node()
+        print("Nodo listener destruido .")
+
+        
