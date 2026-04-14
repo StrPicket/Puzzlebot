@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'basic_comms'
+package_name = 'minichallenge1'
 
 setup(
     name=package_name,
@@ -14,7 +14,7 @@ setup(
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='strpicket',
-    maintainer_email='strpicket@todo.todo',
+    maintainer_email='ejohns.ipod@gmail.com',
     description='TODO: Package description',
     license='TODO: License declaration',
     extras_require={
@@ -24,9 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'talker = basic_comms.talker:main',
-            'listener = basic_comms.listener:main',
-		    'center =  basic_comms.centerAruco:main',
+            'signal_generator = minichallenge1.signal_generator:main',
+            'proc_signal = minichallenge1.process:main',
         ],
     },
 )
