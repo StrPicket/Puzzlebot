@@ -57,12 +57,21 @@ class centerAruco(Node):
         self.wr = Float32()
         self.wl = Float32()
         self.w_robot = 0.0
+        self.v_robot = 0.0
 
         self.radio   = 0.0505
         self.lenght  = 0.183
 
-        self.Kp = 0.1
-        self.Kv = 0.05
+        self.Kp_v = 0.15
+        self.Ki_v = 0.4
+
+        self.int_error_v = 0.0
+
+        self.Kp_w = 0.1
+        self.Kv_w = 0.05
+
+        self.stop_ratio   = 0.25 
+        self.close_enough = False
 
         self.camera_width  = 640
         self.camera_height = 480
@@ -73,9 +82,10 @@ class centerAruco(Node):
         self.cx = None
         self.cy = None
 
+        self.last_time_odom = self.get_clock().now()
         self.last_time_control = self.get_clock().now()
 
-        self.get_logger().info('centerAruco node iniciado ✔')
+        self.get_logger().info('centerAruco node iniciado')
 
     # ── Cambio: imgmsg_to_cv2 en lugar de compressed_imgmsg_to_cv2 ──
     def image_callback(self, msg: Image):
@@ -125,12 +135,23 @@ class centerAruco(Node):
                 cy_m = int(np.mean(pts[:, 1]))
                 cv2.circle(frame, (cx_m, cy_m), 6, (0, 255, 0), -1)
 
-                cv2.putText(frame, f"ID:{int(ids[m_idx][0])}  ({cx_m},{cy_m})",
+                avg_side_px = np.mean([
+                    np.linalg.norm(pts[0] - pts[1]),
+                    np.linalg.norm(pts[1] - pts[2]),
+                    np.linalg.norm(pts[2] - pts[3]),
+                    np.linalg.norm(pts[3] - pts[0]),
+                ])
+                self.ratio = avg_side_px / self.img_width
+ 
+                label_color = (0, 255, 0) if self.ratio >= self.stop_ratio else (0, 255, 255)
+                cv2.putText(frame,
+                            f"ID:{int(ids[m_idx][0])}  ratio:{self.ratio:.2f}/{self.stop_ratio:.2f}",
                             (int(pts[0][0]), int(pts[0][1]) - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, label_color, 2)
 
                 if self.cx is None:
                     self.cx, self.cy = cx_m, cy_m
+                    self.close_enough = self.ratio >= self.stop_ratio
         else:
             cv2.putText(frame, 'No ArUco detected',
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
@@ -149,8 +170,8 @@ class centerAruco(Node):
 
     def odometria(self):
         current_time = self.get_clock().now()
-        dt = (current_time - self.last_time_control).nanoseconds * 1e-9
-        self.last_time_control = current_time
+        dt = (current_time - self.last_time_odom).nanoseconds * 1e-9
+        self.last_time_odom = current_time
 
         if dt <= 0:
             return
@@ -160,7 +181,8 @@ class centerAruco(Node):
         V_avg  = (v_r + v_l) / 2.0
         W_robot = (v_r - v_l) / self.lenght
 
-        self.w_robot = 0.2 * self.w_robot + 0.8 * W_robot
+        self.v_robot = 0.15 * self.v_robot + 0.85 * V_avg
+        self.w_robot = 0.15 * self.w_robot + 0.85 * W_robot
 
         self.x     += V_avg * math.cos(self.theta) * dt
         self.y     += V_avg * math.sin(self.theta) * dt
@@ -178,27 +200,44 @@ class centerAruco(Node):
             self.cmd_vel_pub.publish(cmd)
             return
 
-        error = (self.cx - self.img_width / 2.0) / (self.img_width / 2.0)
+        error_v = self.stop_ratio - self.ratio
+        error_w = (self.cx - self.img_width / 2.0) / (self.img_width / 2.0)
 
-        if abs(error) < 0.05:
+        current_time = self.get_clock().now()
+        dt = (current_time - self.last_time_control).nanoseconds * 1e-9
+        self.last_time_control = current_time
+
+        self.int_error_v += error_v * dt
+        self.int_error_v = max(min(self.int_error_v, 1.0), -1.0)
+
+        if abs(error_w) < 0.05 and self.close_enough:
             cmd.linear.x  = 0.0
             cmd.angular.z = 0.0
             self.cmd_vel_pub.publish(cmd)
-            self.get_logger().info('ArUco centrado ✔ — robot detenido')
+            self.get_logger().info('ArUco centrado y cerca — robot detenido')
             return
 
-        u = self.Kp * error - self.Kv * self.w_robot
-        u = max(min(u, 0.2), -0.2)
+        u_v = self.Ki_v * self.int_error_v - self.Kp_v * self.v_robot
+        u_v = max(min(u_v, 0.7), -0.7)
 
-        cmd.linear.x  = 0.0
-        cmd.angular.z = -u
+        u_w = self.Kp_w * error_w - self.Kv_w * self.w_robot
+        u_w = max(min(u_w, 0.2), -0.2)
+
+        if abs(error_w) > 0.12:
+            cmd.linear.x = 0.0
+            cmd.angular.z = -u_w
+        else:
+            cmd.linear.x = u_v
+            cmd.angular.z = -u_w
 
         self.cmd_vel_pub.publish(cmd)
 
         theta_deg = math.degrees(self.theta) % 360
         self.get_logger().info(
-            f'Error: {error:+.3f} | θ: {theta_deg:.1f}° | '
-            f'w_robot: {self.w_robot:.3f} | u: {u:+.3f}'
+            f'Error_v: {error_v:+.3f} | v_robot: {self.v_robot:.3f} | u_v: {u_v:+.3f}')
+        self.get_logger().info(
+            f'Error_w: {error_w:+.3f} | θ: {theta_deg:.1f}° | '
+            f'w_robot: {self.w_robot:.3f} | u_w: {u_w:+.3f}'
         )
 
 
