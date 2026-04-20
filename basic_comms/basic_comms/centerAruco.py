@@ -65,11 +65,11 @@ class centerAruco(Node):
         self.lenght  = 0.183
 
         self.Kp_v = 0.15
-        self.Ki_v = 0.4
+        self.Ki_v = 0.25
 
         self.int_error_v = 0.0
 
-        self.Kp_w = 0.1
+        self.Kp_w = 0.08
         self.Kv_w = 0.05
 
         self.stop_ratio   = 0.25 
@@ -224,7 +224,7 @@ class centerAruco(Node):
             return
 
         u_v = self.Ki_v * self.int_error_v - self.Kp_v * self.v_robot
-        u_v = max(min(u_v, 0.7), -0.7)
+        u_v = max(min(u_v, 0.5), -0.5)
 
         u_w = self.Kp_w * error_w - self.Kv_w * self.w_robot
         u_w = max(min(u_w, 0.2), -0.2)
