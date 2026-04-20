@@ -1,3 +1,5 @@
+from matplotlib.pyplot import gray
+
 import rclpy
 from rclpy import qos
 from rclpy.node import Node
@@ -40,6 +42,7 @@ class centerAruco(Node):
             depth=10
         )
 
+        # ── Cambio: suscripción a Image (raw) en lugar de CompressedImage ──
         self.image_sub = self.create_subscription(
             Image,
             '/image_raw',
@@ -76,6 +79,8 @@ class centerAruco(Node):
         self.camera_height = 480
         self.img_width     = self.camera_width
 
+        self.detector = aruco.ArucoDetector(aruco_dict, parameters)
+
         self.latest_frame  = None
         self.latest_header = None
         self.cx = None
@@ -86,11 +91,12 @@ class centerAruco(Node):
 
         self.get_logger().info('centerAruco node iniciado')
 
+    # ── Cambio: imgmsg_to_cv2 en lugar de compressed_imgmsg_to_cv2 ──
     def image_callback(self, msg: Image):
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             frame = cv2.resize(frame, (self.camera_width, self.camera_height))
-            frame = cv2.flip(frame, -1)
+            frame = cv2.flip(frame, -1)# -1 = flip horizontal y vertical (180°)
             self.latest_frame  = frame
             self.latest_header = msg.header
         except Exception as e:
@@ -113,7 +119,7 @@ class centerAruco(Node):
         frame = self.latest_frame.copy()
         gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        corners, ids, _ = aruco.detectMarkers(gray, aruco_dict, parameters=parameters)
+        corners, ids, _ = self.detector.detectMarkers(gray)
 
         if ids is not None and len(ids) > 0:
             aruco.drawDetectedMarkers(frame, corners, ids)
