@@ -40,7 +40,6 @@ class centerAruco(Node):
             depth=10
         )
 
-        # ── Cambio: suscripción a Image (raw) en lugar de CompressedImage ──
         self.image_sub = self.create_subscription(
             Image,
             '/image_raw',
@@ -87,12 +86,11 @@ class centerAruco(Node):
 
         self.get_logger().info('centerAruco node iniciado')
 
-    # ── Cambio: imgmsg_to_cv2 en lugar de compressed_imgmsg_to_cv2 ──
     def image_callback(self, msg: Image):
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             frame = cv2.resize(frame, (self.camera_width, self.camera_height))
-            frame = cv2.flip(frame, -1)# -1 = flip horizontal y vertical (180°)
+            frame = cv2.flip(frame, -1)
             self.latest_frame  = frame
             self.latest_header = msg.header
         except Exception as e:
@@ -194,6 +192,11 @@ class centerAruco(Node):
 
         cmd = Twist()
 
+        current_time = self.get_clock().now()
+        dt = (current_time - self.last_time_control).nanoseconds * 1e-9
+        self.last_time_control = current_time
+        dt = min(dt, 0.1)
+
         if self.cx is None:
             cmd.linear.x  = 0.0
             cmd.angular.z = 0.0
@@ -203,16 +206,13 @@ class centerAruco(Node):
         error_v = self.stop_ratio - self.ratio
         error_w = (self.cx - self.img_width / 2.0) / (self.img_width / 2.0)
 
-        current_time = self.get_clock().now()
-        dt = (current_time - self.last_time_control).nanoseconds * 1e-9
-        self.last_time_control = current_time
-
         self.int_error_v += error_v * dt
         self.int_error_v = max(min(self.int_error_v, 1.0), -1.0)
 
         if abs(error_w) < 0.05 and self.close_enough:
             cmd.linear.x  = 0.0
             cmd.angular.z = 0.0
+            self.int_error_d = 0.0
             self.cmd_vel_pub.publish(cmd)
             self.get_logger().info('ArUco centrado y cerca — robot detenido')
             return
