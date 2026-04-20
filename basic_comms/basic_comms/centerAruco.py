@@ -224,7 +224,7 @@ class centerAruco(Node):
             return
 
         u_v = self.Ki_v * self.int_error_v - self.Kp_v * self.v_robot
-        u_v = max(min(u_v, 0.5), -0.5)
+        u_v = max(min(u_v, 0.4), -0.4)
 
         u_w = self.Kp_w * error_w - self.Kv_w * self.w_robot
         u_w = max(min(u_w, 0.2), -0.2)
