@@ -96,7 +96,7 @@ class centerAruco(Node):
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             frame = cv2.resize(frame, (self.camera_width, self.camera_height))
-            frame = cv2.flip(frame, 1)# -1 = flip horizontal y vertical (180°)
+            frame = cv2.flip(frame, -1)# -1 = flip horizontal y vertical (180°)
             self.latest_frame  = frame
             self.latest_header = msg.header
         except Exception as e:
