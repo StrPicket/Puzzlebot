@@ -33,11 +33,11 @@ class waypoints(Node):
         self.lenght  = 0.183
 
         self.Kp_d = 0.15
-        self.Ki_d = 0.4
+        self.Ki_d = 0.25
 
         self.int_error_d = 0.0
 
-        self.Kp_t = 0.1
+        self.Kp_t = 0.08
         self.Kv_t = 0.05
 
         self.last_time_odom = self.get_clock().now()
@@ -106,7 +106,7 @@ class waypoints(Node):
                 self.get_logger().info(f'Waypoint {self.i+1} alcanzado, avanzando al siguiente')
 
         u_d = self.Ki_d * self.int_error_d - self.Kp_d * error_d
-        u_d = max(min(u_d, 0.7), -0.7)
+        u_d = max(min(u_d, 0.4), -0.4)
 
         u_theta = self.Kp_t * error_theta - self.Kv_t * self.w_robot
         u_theta = max(min(u_theta, 0.2), -0.2)
