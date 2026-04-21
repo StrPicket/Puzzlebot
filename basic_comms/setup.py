@@ -27,6 +27,8 @@ setup(
             'talker = basic_comms.talker:main',
             'listener = basic_comms.listener:main',
 		    'center =  basic_comms.centerAruco:main',
+            'waypoints = basic_comms.waypoints:main',
+            'perception = basic_comms.perception:main',
         ],
     },
 )
