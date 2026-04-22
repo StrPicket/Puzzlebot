@@ -35,6 +35,8 @@ class waypoints(Node):
         self.Kp_v = 0.15
         self.Ki_v = 0.25
 
+        self.x_start = 0.0
+        self.y_start = 0.0
         self.int_error_d = 0.0
 
         self.Kp_w = 0.1
@@ -94,6 +96,8 @@ class waypoints(Node):
         if error_d < 0.05:
             self.i += 1
             self.int_error_d = 0.0
+            self.x_start = self.x
+            self.y_start = self.y
             if self.i >= len(self.x_d):
                 cmd.linear.x  = 0.0
                 cmd.angular.z = 0.0
@@ -111,7 +115,9 @@ class waypoints(Node):
             self.int_error_d += error_d * dt
             self.int_error_d = max(min(self.int_error_d, 1.0), -1.0)
 
-            u_v = self.Ki_v * self.int_error_d - self.Kp_v * self.x
+            dr = math.sqrt((self.x - self.x_start)**2 + (self.y - self.y_start)**2)  # distancia recorrida
+
+            u_v = self.Ki_v * self.int_error_d - self.Kp_v * dr
             u_v = max(min(u_v, 0.5), -0.5)
 
         u_w = self.Kp_w * error_theta - self.Kv_w * self.w_robot
