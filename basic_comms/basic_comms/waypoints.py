@@ -32,13 +32,13 @@ class waypoints(Node):
         self.radio   = 0.0505
         self.lenght  = 0.183
 
-        self.Kp_d = 0.15
-        self.Ki_d = 0.25
+        self.Kp_v = 0.15
+        self.Ki_v = 0.25
 
         self.int_error_d = 0.0
 
-        self.Kp_t = 0.08
-        self.Kv_t = 0.05
+        self.Kp_w = 0.1
+        self.Kv_w = 0.05
 
         self.last_time_odom = self.get_clock().now()
         self.last_time_control = self.get_clock().now()
@@ -69,8 +69,8 @@ class waypoints(Node):
         V_avg  = (v_r + v_l) / 2.0
         W_robot = (v_r - v_l) / self.lenght
 
-        self.v_robot = 0.15 * self.v_robot + 0.85 * V_avg
-        self.w_robot = 0.15 * self.w_robot + 0.85 * W_robot
+        self.v_robot = V_avg
+        self.w_robot = W_robot
 
         self.x     += V_avg * math.cos(self.theta) * dt
         self.y     += V_avg * math.sin(self.theta) * dt
@@ -90,9 +90,6 @@ class waypoints(Node):
         error_theta = math.atan2(self.y_d[self.i] - self.y, self.x_d[self.i] - self.x) - self.theta
         error_theta = (error_theta + math.pi) % (2 * math.pi) - math.pi
 
-        self.int_error_d += error_d * dt
-        self.int_error_d = max(min(self.int_error_d, 1.0), -1.0)
-
         if error_d < 0.05:
             self.i += 1
             self.int_error_d = 0.0
@@ -105,26 +102,30 @@ class waypoints(Node):
             else:
                 self.get_logger().info(f'Waypoint {self.i+1} alcanzado, avanzando al siguiente')
 
-        u_d = self.Ki_d * self.int_error_d - self.Kp_d * error_d
-        u_d = max(min(u_d, 0.4), -0.4)
 
-        u_theta = self.Kp_t * error_theta - self.Kv_t * self.w_robot
-        u_theta = max(min(u_theta, 0.2), -0.2)
-
-        if abs(error_theta) > 1.0:
-            cmd.linear.x = 0.0
-            cmd.angular.z = -u_theta
+        if abs(error_theta) > math.radians(5):
+            u_v = 0.0
+            self.int_error_d = 0.0
         else:
-            cmd.linear.x = u_d
-            cmd.angular.z = -u_theta
+            self.int_error_d += error_d * dt
+            self.int_error_d = max(min(self.int_error_d, 1.0), -1.0)
+
+            u_v = self.Ki_v * self.int_error_d - self.Kp_v * self.x
+            u_v = max(min(u_v, 0.5), -0.5)
+
+        u_w = self.Kp_w * error_theta - self.Kv_w * self.w_robot
+        u_w = max(min(u_w, 0.2), -0.2)
+            
+        cmd.linear.x = u_v
+        cmd.angular.z = u_w
 
         self.cmd_vel_pub.publish(cmd)
 
         theta_deg = math.degrees(self.theta) % 360
         self.get_logger().info(
-            f'Error_d: {error_d:+.3f} | x_robot: {self.x:.3f} | y_robot: {self.y:.3f} | u_d: {u_d:+.3f}')
+            f'Error_d: {error_d:+.3f} | x_robot: {self.x:.3f} | y_robot: {self.y:.3f} | u_v: {u_v:+.3f}')
         self.get_logger().info(
-            f'Error_theta: {error_theta:+.3f} | θ: {theta_deg:.1f}°  | u_theta: {u_theta:+.3f}')
+            f'Error_theta: {error_theta:+.3f} | θ: {theta_deg:.1f}°  | u_w: {u_w:+.3f}')
 
 def main(args=None):
     rclpy.init(args=args)
