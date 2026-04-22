@@ -259,5 +259,4 @@ def main(args=None):
         cv2.destroyAllWindows()
         node.destroy_node()
         if rclpy.ok():
-            rclpy.shutdown() 
-            print("prueba")
+            rclpy.shutdown()
