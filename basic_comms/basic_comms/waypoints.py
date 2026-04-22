@@ -44,7 +44,8 @@ class waypoints(Node):
         self.last_time_control = self.get_clock().now()
 
         self.x_d = [1.0, 1.0, 0.0, 0.0]
-        self.y_d = [1.0, 0.0, 0.0, 1.0]
+        self.y_d = [0.0, 1.0, 1.0, 0.0]
+        self.t_d = [0.0, 90.0, 180.0, 270.0]
 
         self.i = 0
 
@@ -87,7 +88,7 @@ class waypoints(Node):
     
         error_d = math.sqrt((self.x_d[self.i] - self.x) ** 2 + (self.y_d[self.i] - self.y) ** 2)
 
-        error_theta = math.atan2(self.y_d[self.i] - self.y, self.x_d[self.i] - self.x) - self.theta
+        error_theta = math.radians(self.t_d[self.i]) - self.theta
         error_theta = (error_theta + math.pi) % (2 * math.pi) - math.pi
 
         if error_d < 0.05:
