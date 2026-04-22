@@ -67,7 +67,7 @@ class centerAruco(Node):
         self.Kp_v = 0.15
         self.Ki_v = 0.25
 
-        self.int_error_v = 0.0
+        self.int_error_r = 0.0
 
         self.Kp_w = 0.08
         self.Kv_w = 0.05
@@ -209,38 +209,39 @@ class centerAruco(Node):
             self.cmd_vel_pub.publish(cmd)
             return
 
-        error_v = self.stop_ratio - self.ratio
+        error_r = self.stop_ratio - self.ratio
         error_w = (self.cx - self.img_width / 2.0) / (self.img_width / 2.0)
 
-        self.int_error_v += error_v * dt
-        self.int_error_v = max(min(self.int_error_v, 1.0), -1.0)
 
         if abs(error_w) < 0.05 and self.close_enough:
             cmd.linear.x  = 0.0
             cmd.angular.z = 0.0
-            self.int_error_d = 0.0
+            self.int_error_r = 0.0
             self.cmd_vel_pub.publish(cmd)
             self.get_logger().info('ArUco centrado y cerca — robot detenido')
             return
 
-        u_v = self.Ki_v * self.int_error_v - self.Kp_v * self.v_robot
-        u_v = max(min(u_v, 0.4), -0.4)
+        if abs(error_w) > 0.12:
+            u_v = 0.0
+            self.int_error_r = 0.0
+        else:
+            self.int_error_r += error_r * dt
+            self.int_error_r = max(min(self.int_error_r, 1.0), -1.0)
+
+            u_v = self.Ki_v * self.int_error_r - self.Kp_v * self.ratio
+            u_v = max(min(u_v, 0.4), -0.4)
 
         u_w = self.Kp_w * error_w - self.Kv_w * self.w_robot
         u_w = max(min(u_w, 0.2), -0.2)
-
-        if abs(error_w) > 0.12:
-            cmd.linear.x = 0.0
-            cmd.angular.z = -u_w
-        else:
-            cmd.linear.x = u_v
-            cmd.angular.z = -u_w
+            
+        cmd.linear.x = u_v
+        cmd.angular.z = -u_w
 
         self.cmd_vel_pub.publish(cmd)
 
         theta_deg = math.degrees(self.theta) % 360
         self.get_logger().info(
-            f'Error_v: {error_v:+.3f} | v_robot: {self.v_robot:.3f} | u_v: {u_v:+.3f}')
+            f'Error_r: {error_r:+.3f} | v_robot: {self.v_robot:.3f} | u_v: {u_v:+.3f}')
         self.get_logger().info(
             f'Error_w: {error_w:+.3f} | θ: {theta_deg:.1f}° | '
             f'w_robot: {self.w_robot:.3f} | u_w: {u_w:+.3f}'
