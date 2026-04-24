@@ -31,6 +31,7 @@ setup(
             'perception = basic_comms.perception:main',
             'poseEstimation = basic_comms.poseEstimation:main',
             'monteCarlo = basic_comms.monteCarlo:main',
+            'particle_filter = basic_comms.particle_filter:main',
         ],
     },
 )

@@ -19,7 +19,7 @@ import numpy as np
 import math
 
 # Filtro de partículas (mismo directorio o en PYTHONPATH)
-from particle_filter import ParticleFilter
+from basic_comms.particle_filter import ParticleFilter
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  CONFIGURACIÓN GLOBAL
