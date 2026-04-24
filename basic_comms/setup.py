@@ -29,6 +29,8 @@ setup(
 		    'center =  basic_comms.centerAruco:main',
             'waypoints = basic_comms.waypoints:main',
             'perception = basic_comms.perception:main',
+            'poseEstimation = basic_comms.poseEstimation:main',
+            'monteCarlo = basic_comms.monteCarlo:main',
         ],
     },
 )
