@@ -1,34 +1,3 @@
-"""
-aruco_pose.py  -  Medición de posición con ArUcos para PuzzleBot
-=================================================================
-Solo detecta ArUcos y estima la posición del robot usando solvePnP.
-Filtro de Kalman para suavizar la estimación de pose.
-
-Publicaciones
--------------
-  /aruco/image_detected   : imagen anotada con marcadores y ejes 3-D
-  /aruco/pose             : PoseWithCovarianceStamped con la pose estimada
-
-Ventanas OpenCV
----------------
-  "ArUco Pose"  : imagen de la cámara con marcadores y ejes 3-D anotados
-  "Mapa Pista"  : vista top-down con posición del robot y ArUcos visibles
-
-Parámetros que debes ajustar
-------------------------------
-  ARUCO_MAP   : dict  {id: (x_m, y_m, θ_rad)}  - pose de cada ArUco en la pista
-  MARKER_SIZE : tamaño real del marcador en metros
-
-  KF_Q_XY    : ruido de proceso en posición (m²/paso)  — más alto = sigue más rápido la medición
-  KF_Q_THETA : ruido de proceso en ángulo  (rad²/paso) — más alto = sigue más rápido la medición
-  KF_R_XY    : ruido de medición en posición (m²)      — más alto = confía menos en ArUco
-  KF_R_THETA : ruido de medición en ángulo  (rad²)     — más alto = confía menos en ArUco
-
-Calibración incluida (cámara PuzzleBot)
-  fx=133.87  fy=131.03  cx=157.77  cy=93.02
-  dist=[-0.157, -0.618, -0.010, -0.007, 0.744]
-"""
-
 import rclpy
 from rclpy import qos
 from rclpy.node import Node
