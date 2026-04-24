@@ -19,7 +19,7 @@ import numpy as np
 import math
 
 # Filtro de partículas (mismo directorio o en PYTHONPATH)
-from basic_comms.particle_filter import ParticleFilter
+from particle_filter import ParticleFilter
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  CONFIGURACIÓN GLOBAL
@@ -48,8 +48,8 @@ ARUCO_MAP = {
 }
 
 # ── Teleoperación ────────────────────────────────────────────────────────────
-VEL_LINEAR  = 0.25   # m/s
-VEL_ANGULAR = 0.20   # rad/s
+VEL_LINEAR  = 0.15   # m/s
+VEL_ANGULAR = 0.15   # rad/s
 
 # ── Robot ────────────────────────────────────────────────────────────────────
 WHEEL_RADIUS = 0.0505   # m
@@ -377,6 +377,10 @@ class TeleopMCLNode(Node):
         self.w_cmd = 0.0
         self.kbd   = KeyboardReader()
 
+        # ── Ventana de visualización ──────────────────────────────────────────
+        cv2.namedWindow("MCL - Mapa Pista", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("MCL - Mapa Pista", MAP_W, MAP_H)
+
         # ── Timers ────────────────────────────────────────────────────────
         self.t_odom   = self.create_timer(1 / 100, self._cb_odom)
         self.t_main   = self.create_timer(1 /  30, self._cb_main)
@@ -591,7 +595,7 @@ class TeleopMCLNode(Node):
         cv2.putText(mapa, f"Neff {self.pf.neff:.0f}/{N_PARTICLES}",
                     (MAP_W - 190, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.30, (160,160,160), 1)
 
-        cv2.imshow("MCL — Mapa Pista", mapa)
+        cv2.imshow("MCL - Mapa Pista", mapa)   # mismo nombre, sin em-dash
         if cv2.waitKey(1) & 0xFF == ord('q'):
             self._shutdown()
 
