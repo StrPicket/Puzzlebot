@@ -140,6 +140,7 @@ class ParticleFilter:
         delta_rot2 = _wrap(dtheta - delta_rot1)
 
         self._apply_motion(delta_rot1, delta_trans, delta_rot2)
+        self._update_estimate() 
 
     def _apply_motion(self, rot1: float, trans: float, rot2: float):
         """Aplica ruido gaussiano al modelo de movimiento diferencial."""
