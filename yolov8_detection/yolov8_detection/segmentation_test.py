@@ -25,7 +25,7 @@ class YoloV8Detection(Node):
         self.declare_parameter('use_compressed', False)
 
         self.declare_parameter('model_name', 'best.pt')
-        self.declare_parameter('confidence_threshold', 0.3)
+        self.declare_parameter('confidence_threshold', 0.6)
         self.declare_parameter('update_rate', 15.0)
 
         # Retrieve parameters
@@ -152,6 +152,7 @@ class YoloV8Detection(Node):
                         coords = box.xyxy[0].cpu().numpy()
                         cls_id = int(box.cls[0].cpu().numpy())
                         class_name = self.model.names[cls_id]
+                        self.get_logger().info( f"Detected: {class_name} | conf={conf:.2f}")
 
                         inference_result = InferenceResult()
 
