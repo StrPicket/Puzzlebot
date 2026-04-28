@@ -25,7 +25,7 @@ class YoloV8Detection(Node):
         self.declare_parameter('use_compressed', False)
 
         self.declare_parameter('model_name', 'best.pt')
-        self.declare_parameter('confidence_threshold', 0.6)
+        self.declare_parameter('confidence_threshold', 0.8)
         self.declare_parameter('update_rate', 15.0)
 
         # Retrieve parameters
@@ -169,7 +169,7 @@ class YoloV8Detection(Node):
                             annotated_frame,
                             (int(coords[0]), int(coords[1])),
                             (int(coords[2]), int(coords[3])),
-                            (0, 255, 0),
+                            (255, 150, 125),
                             2
                         )
 
@@ -195,7 +195,7 @@ class YoloV8Detection(Node):
                                 annotated_frame,
                                 contours,
                                 -1,
-                                (255, 0, 255),
+                                (0, 155, 0),
                                 2
                             )
             
