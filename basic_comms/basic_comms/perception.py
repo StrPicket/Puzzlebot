@@ -14,8 +14,8 @@ class PuzzlebotAutoCapture(Node):
     def __init__(self):
         super().__init__('puzzlebot_auto_capture')
 
-        self.total_photos = 20
-        self.interval = 2.0
+        self.total_photos = 500
+        self.interval = 1.5
         self.save_dir = "calib_puzzlebot_logitec"
         self.image_topic = "/image_raw"
 
