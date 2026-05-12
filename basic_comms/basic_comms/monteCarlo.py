@@ -1,647 +1,564 @@
-import sys
-import select
-import tty
-import termios
-import threading
-
-import rclpy
-from rclpy import qos
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-from sensor_msgs.msg import Image
-from geometry_msgs.msg import Twist, PoseWithCovarianceStamped
-from std_msgs.msg import Float32
-
-import cv2
-from cv2 import aruco
-from cv_bridge import CvBridge
+import os, sys, time, threading
 import numpy as np
-import math
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from matplotlib.gridspec import GridSpec
+from scipy.ndimage import distance_transform_edt
 
-# Filtro de partículas (mismo directorio o en PYTHONPATH)
-from basic_comms.particle_filter import ParticleFilter
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  CONFIGURACIÓN GLOBAL
-# ═══════════════════════════════════════════════════════════════════════════
-
-# ── Cámara ──────────────────────────────────────────────────────────────────
-CAMERA_MATRIX = np.array([
-    [133.87191654,   0.0,         157.76772928],
-    [  0.0,         131.02895435,  93.02396443],
-    [  0.0,           0.0,           1.0      ]
-], dtype=np.float64)
-
-DIST_COEFFS = np.array(
-    [[-0.15698471, -0.61753973, -0.01000248, -0.00749885, 0.7441658]],
-    dtype=np.float64
+# CoppeliaSim ZMQ remote API
+ZMQAPI_PATH = os.path.expanduser(
+    '~/Descargas/CoppeliaSim_Edu_V4_10_0_rev0_Ubuntu22_04'
+    '/programming/zmqRemoteApi/clients/python'
 )
-
-# ── ArUcos ──────────────────────────────────────────────────────────────────
-MARKER_SIZE = 0.055   # metros
-
-ARUCO_MAP = {
-    1: (4.20,  3.70,  -math.pi / 2),
-    2: (4.20,  0.0,   math.pi  / 2),
-    3: (0.6,   3.70,  -math.pi / 2),
-    4: (0.6,   0.0,   math.pi  / 2),
-}
-
-# ── Teleoperación ────────────────────────────────────────────────────────────
-VEL_LINEAR  = 0.15   # m/s
-VEL_ANGULAR = 0.15   # rad/s
-
-# ── Robot ────────────────────────────────────────────────────────────────────
-WHEEL_RADIUS = 0.0505   # m
-WHEEL_BASE   = 0.183    # m
-CAM_OFFSET_X = 0.12     # m (cámara adelante del centro)
-
-# ── Filtro de partículas ──────────────────────────────────────────────────────
-N_PARTICLES = 300
-
-# ── Mapa top-down ────────────────────────────────────────────────────────────
-MAP_W, MAP_H = 720, 540
-MAP_PAD      = 50
-WORLD_X_MAX  = 4.8
-WORLD_Y_MAX  = 3.7
-
-# Colores BGR
-C_BG         = (20,  20,  20)
-C_GRID       = (50,  50,  50)
-C_BOUNDARY   = (80,  80,  80)
-C_PARTICLE   = (30, 140, 255)    # partículas
-C_ROBOT_MCL  = (0,  220, 100)    # pose MCL
-C_ROBOT_ODOM = (80, 180, 255)    # pose odométrica
-C_ARUCO_UNK  = (100,100,100)
-C_ARUCO_VIS  = (50, 220,  50)
-C_LINE       = (80, 160,  80)
-C_TEXT       = (200,200,200)
-
-# ── Detector ArUco ────────────────────────────────────────────────────────────
-_aruco_dict   = aruco.getPredefinedDictionary(aruco.DICT_APRILTAG_36H11)
+COPPELIA_AVAILABLE = False
 try:
-    _det_params = aruco.DetectorParameters()
-except AttributeError:
-    _det_params = aruco.DetectorParameters_create()
+    from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+    COPPELIA_AVAILABLE = True
+except ImportError:
+    if os.path.isdir(ZMQAPI_PATH):
+        sys.path.insert(0, ZMQAPI_PATH)
+        try:
+            from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+            COPPELIA_AVAILABLE = True
+        except ImportError:
+            pass
+if not COPPELIA_AVAILABLE:
+    print("[WARN] coppeliasim_zmqremoteapi_client not found — running in SIMULATED mode.")
+
+# ── Config ────────────────────────────────────────────────────────────────────
+COPPELIA_HOST   = '10.22.153.25'
+COPPELIA_PORT   = 23000
+
+OBJ_ROBOT       = '/LineTracer'
+OBJ_LEFT_JOINT  = '/DynamicLeftJoint'
+OBJ_RIGHT_JOINT = '/DynamicRightJoint'
+OBJ_LIDAR       = '/LaserScanner2D'
+OBJ_LIDAR_JOINT = '/LaserScanner2D/joint'
+
+WHEEL_RADIUS    = 0.027
+WHEEL_DISTANCE  = 0.119
+
+MAP_SIZE_CM     = 250
+PIXELS_PER_CM   = 1
+MAP_SIZE_PX     = MAP_SIZE_CM * PIXELS_PER_CM
+
+N_PARTICLES     = 200
+N_LIDAR_RAYS    = 16
+N_LIDAR_REAL    = 32
+LIDAR_MAX_CM    = 500
+
+TRANS_NOISE     = 1.5
+ROT_NOISE       = np.deg2rad(3)
+
+SIGMA_INIT      = 25.0
+SIGMA_MIN       = 1.0
+SIGMA_DECAY     = 0.85
+
+M_TO_CM         = 100
+TOP_K_FRACTION  = 0.1
+PIXEL_SCORE_RADIUS_CM = 5
+
+OBSTACLES_CM = [
+    (0,   225, 50,  25),
+    (150, 150, 100, 100),
+    (0,   100, 25,  25),
+    (0,   0,   100, 100),
+    (200, 0,   50,  50),
+    (200, 100, 50,  50),
+]
+
+# ── Map ───────────────────────────────────────────────────────────────────────
+
+def build_map(obstacles, size_px, px_per_cm):
+    grid = np.zeros((size_px, size_px), dtype=np.uint8)
+    grid[:, :2] = 1;  grid[:, -2:] = 1
+    grid[:2, :] = 1;  grid[-2:, :] = 1
+    for xc, yc, w, h in obstacles:
+        x0, x1 = int(xc * px_per_cm), int((xc + w) * px_per_cm)
+        y0, y1 = int(yc * px_per_cm), int((yc + h) * px_per_cm)
+        grid[y0:y1, x0:x1] = 1
+    return grid
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  GEOMETRÍA AUXILIAR
-# ═══════════════════════════════════════════════════════════════════════════
-
-def wrap(a: float) -> float:
-    return (a + math.pi) % (2 * math.pi) - math.pi
-
-def marker_side_px(pts: np.ndarray) -> float:
-    sides = [
-        np.linalg.norm(pts[1] - pts[0]),
-        np.linalg.norm(pts[2] - pts[1]),
-        np.linalg.norm(pts[3] - pts[2]),
-        np.linalg.norm(pts[0] - pts[3]),
-    ]
-    return float(np.mean(sides))
-
-def dist_from_pixels(side_px: float) -> float:
-    fx = CAMERA_MATRIX[0, 0]
-    fy = CAMERA_MATRIX[1, 1]
-    f  = (fx + fy) / 2.0
-    if side_px < 2.0:
-        return -1.0
-    return f * MARKER_SIZE / side_px
-
-def estimate_robot_pose_aruco(tvec, rvec, marker_id, pts):
-    """
-    Devuelve (robot_x, robot_y, robot_theta, dist_h, bearing)
-    o None si el marcador no está en el mapa.
-    """
-    if marker_id not in ARUCO_MAP:
-        return None
-
-    mx, my, m_yaw = ARUCO_MAP[marker_id]
-    R, _  = cv2.Rodrigues(rvec)
-    R_inv = R.T
-    t_inv = -R_inv @ tvec
-
-    cam_x   = -t_inv[0][0]
-    side_px = marker_side_px(pts)
-    dist_px = dist_from_pixels(side_px)
-    if dist_px < 0:
-        return None
-
-    cam_z = math.sqrt(max(dist_px**2 - cam_x**2, 0.0))
-    dist_h  = math.sqrt(cam_x**2 + cam_z**2)
-    bearing = math.atan2(cam_x, cam_z)
-
-    yaw_cam     = math.atan2(R_inv[0, 2], R_inv[2, 2])
-    robot_theta = wrap(m_yaw - yaw_cam)
-
-    robot_x = mx + cam_z * math.cos(m_yaw) - cam_x * math.sin(m_yaw)
-    robot_y = my + cam_z * math.sin(m_yaw) + cam_x * math.cos(m_yaw)
-
-    # Corrección cámara → centro del robot
-    robot_x -= CAM_OFFSET_X * math.cos(robot_theta)
-    robot_y -= CAM_OFFSET_X * math.sin(robot_theta)
-
-    return robot_x, robot_y, robot_theta, dist_h, bearing
+def build_dist_transform(grid):
+    free = (grid == 0).astype(np.float32)
+    return distance_transform_edt(free).astype(np.float32)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  MAPA TOP-DOWN
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Ray casting (sphere tracing) ──────────────────────────────────────────────
 
-def _w2m(wx, wy):
-    """Coordenadas globales (m) → píxeles en el canvas."""
-    dw = MAP_W - 2 * MAP_PAD
-    dh = MAP_H - 2 * MAP_PAD
-    sc = min(dw / WORLD_X_MAX, dh / WORLD_Y_MAX)
-    px = int(MAP_PAD + wx * sc)
-    py = int(MAP_H - MAP_PAD - wy * sc)
-    return px, py
+def batch_lidar(grid, dt, xs, ys, thetas, n_rays, max_range, px_per_cm):
+    size_px  = grid.shape[0]
+    N        = len(xs)
+    ray_angs = np.linspace(-np.deg2rad(45), np.deg2rad(45), n_rays, endpoint=True)
+    ang      = thetas[:, None] + ray_angs[None, :]
+    ddx, ddy = np.cos(ang), np.sin(ang)
 
-def draw_map(odom_x, odom_y, odom_th,
-             mcl_x, mcl_y, mcl_th,
-             particles: np.ndarray,
-             visible_ids: list) -> np.ndarray:
+    cx = (xs * px_per_cm).astype(np.float32)[:, None] * np.ones((1, n_rays), np.float32)
+    cy = (ys * px_per_cm).astype(np.float32)[:, None] * np.ones((1, n_rays), np.float32)
+    dx = (ddx * px_per_cm).astype(np.float32)
+    dy = (ddy * px_per_cm).astype(np.float32)
 
-    canvas = np.full((MAP_H, MAP_W, 3), C_BG, dtype=np.uint8)
+    dists    = np.full((N, n_rays), max_range, dtype=np.float32)
+    hit      = np.zeros((N, n_rays), dtype=bool)
+    traveled = np.zeros((N, n_rays), dtype=np.float32)
+    max_px   = int(max_range * px_per_cm)
+    MIN_STEP = 0.5
 
-    # ── Grid ────────────────────────────────────────────────────────────────
-    step = 0.6
-    x = 0.0
-    while x <= WORLD_X_MAX:
-        gx, _ = _w2m(x, 0)
-        cv2.line(canvas, (gx, MAP_PAD), (gx, MAP_H - MAP_PAD), C_GRID, 1)
-        cv2.putText(canvas, f"{x:.1f}", (gx + 2, MAP_H - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, (120, 120, 120), 1)
-        x += step
-    y = 0.0
-    while y <= WORLD_Y_MAX:
-        _, gy = _w2m(0, y)
-        cv2.line(canvas, (MAP_PAD, gy), (MAP_W - MAP_PAD, gy), C_GRID, 1)
-        cv2.putText(canvas, f"{y:.1f}", (2, gy - 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, (120, 120, 120), 1)
-        y += step
+    for _ in range(max_px):
+        col = cx.astype(np.int32)
+        row = cy.astype(np.int32)
 
-    # Borde de la pista
-    p0 = _w2m(0, 0)
-    p1 = _w2m(WORLD_X_MAX, WORLD_Y_MAX)
-    cv2.rectangle(canvas, p0, p1, C_BOUNDARY, 1)
+        out     = (col < 0) | (col >= size_px) | (row < 0) | (row >= size_px)
+        new_out = (~hit) & out
+        dists[new_out] = traveled[new_out] / px_per_cm
+        hit |= new_out
+        if hit.all(): break
 
-    # ── Partículas ───────────────────────────────────────────────────────────
-    if particles is not None and len(particles):
-        for p in particles:
-            ppx, ppy = _w2m(p[0], p[1])
-            if 0 <= ppx < MAP_W and 0 <= ppy < MAP_H:
-                cv2.circle(canvas, (ppx, ppy), 2, C_PARTICLE, -1)
+        col_c = np.clip(col, 0, size_px - 1)
+        row_c = np.clip(row, 0, size_px - 1)
 
-    # ── ArUcos del mapa ──────────────────────────────────────────────────────
-    for mid, (mx, my, mth) in ARUCO_MAP.items():
-        px, py = _w2m(mx, my)
-        col = C_ARUCO_VIS if mid in visible_ids else C_ARUCO_UNK
-        cv2.rectangle(canvas, (px - 9, py - 9), (px + 9, py + 9), col, -1)
-        cv2.rectangle(canvas, (px - 9, py - 9), (px + 9, py + 9), (180, 180, 180), 1)
-        al = 16
-        ax = int(px + al * math.cos(mth))
-        ay = int(py - al * math.sin(mth))
-        cv2.arrowedLine(canvas, (px, py), (ax, ay), col, 2, tipLength=0.4)
-        cv2.putText(canvas, f"#{mid}", (px + 11, py - 7),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, col, 1)
+        obstacle = grid[row_c, col_c] > 0
+        new_obs  = (~hit) & (~out) & obstacle
+        dists[new_obs] = traveled[new_obs] / px_per_cm
+        hit |= new_obs
+        if hit.all(): break
 
-    # ── Líneas robot → ArUcos visibles ───────────────────────────────────────
-    mx_px, my_px = _w2m(mcl_x, mcl_y)
-    for mid in visible_ids:
-        if mid in ARUCO_MAP:
-            apx, apy = _w2m(ARUCO_MAP[mid][0], ARUCO_MAP[mid][1])
-            cv2.line(canvas, (mx_px, my_px), (apx, apy), C_LINE, 1, cv2.LINE_AA)
+        safe_px  = dt[row_c, col_c]
+        step_px  = np.where(hit, 0.0,
+                            np.maximum(MIN_STEP, np.minimum(safe_px, max_px - traveled)))
+        traveled += step_px
+        cx       += dx * (step_px / px_per_cm)
+        cy       += dy * (step_px / px_per_cm)
 
-    # ── Pose odométrica (azul claro, más tenue) ──────────────────────────────
-    ox, oy = _w2m(odom_x, odom_y)
-    cv2.circle(canvas, (ox, oy), 7, C_ROBOT_ODOM, -1)
-    al = 14
-    cv2.arrowedLine(canvas, (ox, oy),
-                    (int(ox + al * math.cos(odom_th)),
-                     int(oy - al * math.sin(odom_th))),
-                    C_ROBOT_ODOM, 1, tipLength=0.4)
+        hit |= (~hit) & (traveled >= max_px)
+        if hit.all(): break
 
-    # ── Pose MCL (verde brillante) ───────────────────────────────────────────
-    cv2.circle(canvas, (mx_px, my_px), 11, C_ROBOT_MCL, -1)
-    cv2.circle(canvas, (mx_px, my_px), 11, (200, 255, 200), 1)
-    al = 20
-    cv2.arrowedLine(canvas, (mx_px, my_px),
-                    (int(mx_px + al * math.cos(mcl_th)),
-                     int(my_px - al * math.sin(mcl_th))),
-                    (255, 255, 255), 2, cv2.LINE_AA, tipLength=0.3)
-
-    # ── Leyenda ──────────────────────────────────────────────────────────────
-    cv2.circle(canvas, (MAP_W - 130, 18), 6, C_ROBOT_ODOM, -1)
-    cv2.putText(canvas, "Odometría", (MAP_W - 120, 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, C_ROBOT_ODOM, 1)
-    cv2.circle(canvas, (MAP_W - 130, 36), 6, C_ROBOT_MCL, -1)
-    cv2.putText(canvas, "MCL", (MAP_W - 120, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, C_ROBOT_MCL, 1)
-    cv2.circle(canvas, (MAP_W - 130, 50), 4, C_PARTICLE, -1)
-    cv2.putText(canvas, "Partículas", (MAP_W - 120, 54),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, C_PARTICLE, 1)
-
-    # ── Texto de estado ──────────────────────────────────────────────────────
-    cv2.putText(canvas,
-        f"Odom  x={odom_x:.2f} y={odom_y:.2f} th={math.degrees(odom_th):.1f}deg",
-        (8, MAP_H - 28), cv2.FONT_HERSHEY_SIMPLEX, 0.36, C_ROBOT_ODOM, 1)
-    cv2.putText(canvas,
-        f"MCL   x={mcl_x:.2f}  y={mcl_y:.2f}  th={math.degrees(mcl_th):.1f}deg",
-        (8, MAP_H - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.36, C_ROBOT_MCL, 1)
-
-    return canvas
+    return dists
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  LECTURA DE TECLADO (no-bloqueante)
-# ═══════════════════════════════════════════════════════════════════════════
+def single_lidar(grid, dt, x, y, theta, n_rays, max_range, px_per_cm):
+    return batch_lidar(grid, dt,
+                       np.array([x]), np.array([y]), np.array([theta]),
+                       n_rays, max_range, px_per_cm)[0]
 
-class KeyboardReader:
-    """Lee teclas en modo raw sin bloquear el hilo principal."""
 
-    KEY_MAP = {
-        '\x1b[A': 'UP',    '\x1b[B': 'DOWN',
-        '\x1b[C': 'RIGHT', '\x1b[D': 'LEFT',
-        'w': 'UP',    's': 'DOWN',
-        'a': 'LEFT',  'd': 'RIGHT',
-        ' ': 'STOP',
-        'r': 'RESET', 'R': 'RESET',
-        'q': 'QUIT',  '\x1b': 'QUIT',
+# ── Scoring ───────────────────────────────────────────────────────────────────
+
+def pixel_score_particles(particles, obs_scan, grid, n_rays, px_per_cm, radius_cm=3):
+    size_px  = grid.shape[0]
+    N        = len(particles)
+    ray_angs = np.linspace(-np.deg2rad(45), np.deg2rad(45), n_rays, endpoint=True)
+
+    angles   = particles[:, 2:3] + ray_angs[None, :]
+    impact_x = particles[:, 0:1] + obs_scan[None, :] * np.cos(angles)
+    impact_y = particles[:, 1:2] + obs_scan[None, :] * np.sin(angles)
+
+    col   = (impact_x * px_per_cm).astype(np.int32)
+    row   = (impact_y * px_per_cm).astype(np.int32)
+    valid = (col >= 0) & (col < size_px) & (row >= 0) & (row < size_px)
+    col_c = np.clip(col, 0, size_px - 1)
+    row_c = np.clip(row, 0, size_px - 1)
+
+    r_px       = max(1, int(radius_cm * px_per_cm))
+    pixel_hits = np.zeros((N, n_rays), dtype=np.float32)
+
+    for dr in range(-r_px, r_px + 1):
+        for dc in range(-r_px, r_px + 1):
+            if dr * dr + dc * dc > r_px * r_px:
+                continue
+            r2 = np.clip(row_c + dr, 0, size_px - 1)
+            c2 = np.clip(col_c + dc, 0, size_px - 1)
+            pixel_hits += grid[r2, c2].astype(np.float32)
+
+    pixel_hits[~valid] = 0.0
+    area   = np.pi * r_px ** 2 + 1
+    scores = pixel_hits.sum(axis=1) / (n_rays * area)
+    return scores.astype(np.float64)
+
+
+def score_particles_batch(particles, obs_scan, grid, dt,
+                           n_rays, max_range, px_per_cm, sigma):
+    xs, ys, thetas = particles[:, 0], particles[:, 1], particles[:, 2]
+    sim_scans  = batch_lidar(grid, dt, xs, ys, thetas, n_rays, max_range, px_per_cm)
+    diff       = np.abs(sim_scans - obs_scan[None, :])
+    gauss      = np.mean(np.exp(-0.5 * (diff / sigma) ** 2), axis=1)
+    px_score   = pixel_score_particles(
+        particles, obs_scan, grid, n_rays, px_per_cm, PIXEL_SCORE_RADIUS_CM)
+    return gauss * (1.0 + px_score)
+
+
+# ── Particle filter ───────────────────────────────────────────────────────────
+
+def sample_free(grid, map_size_cm, px_per_cm, n):
+    size_px = grid.shape[0]
+    pts     = []
+    while len(pts) < n:
+        bx   = np.random.uniform(5, map_size_cm - 5, n * 4)
+        by   = np.random.uniform(5, map_size_cm - 5, n * 4)
+        cols = (bx * px_per_cm).astype(np.int32)
+        rows = (by * px_per_cm).astype(np.int32)
+        valid = ((cols >= 0) & (cols < size_px) &
+                 (rows >= 0) & (rows < size_px) &
+                 (grid[rows, cols] == 0))
+        for x, y in zip(bx[valid], by[valid]):
+            pts.append([x, y, np.random.uniform(0, 2 * np.pi)])
+            if len(pts) == n:
+                break
+    return np.array(pts[:n], dtype=np.float64)
+
+
+def motion_update(particles, d_trans, d_rot):
+    n   = len(particles)
+    nt  = d_trans + np.random.normal(0, TRANS_NOISE, n)
+    nr  = d_rot   + np.random.normal(0, ROT_NOISE,   n)
+    p   = particles.copy()
+    p[:, 0] += nt * np.cos(particles[:, 2] + nr / 2)
+    p[:, 1] += nt * np.sin(particles[:, 2] + nr / 2)
+    p[:, 2]  = (particles[:, 2] + nr) % (2 * np.pi)
+    return p
+
+
+def topk_filter_and_resample(particles, weights, grid, map_size_cm, px_per_cm,
+                              top_k_frac=TOP_K_FRACTION, random_frac=0.05):
+    N         = len(particles)
+    k         = max(1, int(N * top_k_frac))
+    n_random  = max(1, int(N * random_frac))
+    order     = np.argsort(weights)[::-1]
+    top_idx   = order[:k]
+    rest_idx  = order[k:]
+
+    new_p  = particles.copy()
+    w_top  = weights[top_idx]
+    w_top /= w_top.sum() + 1e-300
+    chosen  = np.random.choice(k, size=len(rest_idx), replace=True, p=w_top)
+
+    new_p[rest_idx]     = particles[top_idx[chosen]].copy()
+    new_p[rest_idx, 0] += np.random.normal(0, 1.5,            len(rest_idx))
+    new_p[rest_idx, 1] += np.random.normal(0, 1.5,            len(rest_idx))
+    new_p[rest_idx, 2] += np.random.normal(0, np.deg2rad(3),  len(rest_idx))
+    new_p[rest_idx, 2] %= (2 * np.pi)
+
+    new_p[order[-n_random:]] = sample_free(grid, map_size_cm, px_per_cm, n_random)
+    return new_p
+
+
+def keep_in_bounds_vectorized(particles, grid, map_size_cm, px_per_cm):
+    size_px = grid.shape[0]
+    p       = particles.copy()
+    p[:, 0] = np.clip(p[:, 0], 2, map_size_cm - 2)
+    p[:, 1] = np.clip(p[:, 1], 2, map_size_cm - 2)
+
+    cols    = np.clip((p[:, 0] * px_per_cm).astype(np.int32), 0, size_px - 1)
+    rows    = np.clip((p[:, 1] * px_per_cm).astype(np.int32), 0, size_px - 1)
+    in_wall = grid[rows, cols] > 0
+
+    if in_wall.sum() > 0:
+        p[in_wall] = sample_free(grid, map_size_cm, px_per_cm, in_wall.sum())
+    return p
+
+
+def weighted_mean_pose(particles, weights):
+    w   = weights / (weights.sum() + 1e-300)
+    ex  = np.sum(particles[:, 0] * w)
+    ey  = np.sum(particles[:, 1] * w)
+    eth = np.arctan2(
+        np.sum(np.sin(particles[:, 2]) * w),
+        np.sum(np.cos(particles[:, 2]) * w))
+    return ex, ey, eth
+
+
+def convergence_score(weights):
+    w    = weights / (weights.sum() + 1e-300)
+    neff = 1.0 / (np.sum(w ** 2) + 1e-300)
+    return neff / len(weights)
+
+
+# ── CoppeliaSim interface ─────────────────────────────────────────────────────
+
+class CoppeliaInterface:
+    _grid_ref = None
+    _dt_ref   = None
+
+    def __init__(self):
+        self.connected  = False
+        self.pose       = (MAP_SIZE_CM / 2, MAP_SIZE_CM / 2, 0.0)
+        self.scan       = np.full(N_LIDAR_RAYS, LIDAR_MAX_CM)
+        self._data_lock = threading.Lock()
+        self._sim_lock  = threading.Lock()
+        self._running   = True
+        self.has_lidar  = False
+
+        if not COPPELIA_AVAILABLE:
+            return
+        try:
+            client   = RemoteAPIClient(COPPELIA_HOST, COPPELIA_PORT)
+            self.sim = client.getObject('sim')
+            print(f"[Coppelia] Connected  t={self.sim.getSimulationTime():.2f}s")
+
+            self.robot_h     = self.sim.getObject(OBJ_ROBOT)
+            self.lw          = self.sim.getObject(OBJ_LEFT_JOINT)
+            self.rw          = self.sim.getObject(OBJ_RIGHT_JOINT)
+            self.lidar_joint = self.sim.getObject(OBJ_LIDAR_JOINT)
+
+            try:
+                self.lidar_h      = self.sim.getObject(OBJ_LIDAR)
+                self.lidar_sensor = self.sim.getObject('/LaserScanner2D/joint/sensor')
+                self.has_lidar    = True
+                print("[Coppelia] LIDAR found.")
+            except Exception:
+                print("[Coppelia] LIDAR not found — using simulated scan.")
+
+            self.connected = True
+        except Exception as e:
+            print(f"[Coppelia] Connection failed: {e} — SIMULATED mode")
+
+    def start(self):
+        threading.Thread(target=self._pose_loop,  daemon=True).start()
+        threading.Thread(target=self._lidar_loop, daemon=True).start()
+
+    def _pose_loop(self):
+        while self._running:
+            if self.connected:
+                try:
+                    with self._sim_lock:
+                        self._read_pose()
+                except Exception as e:
+                    print(f"[Pose] error: {e}")
+            time.sleep(0.05)
+
+    def _read_pose(self):
+        pos  = self.sim.getObjectPosition(self.robot_h, -1)
+        quat = self.sim.getObjectQuaternion(self.robot_h, -1)
+        x, y, z, w = quat
+        yaw   = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        x_map = pos[0] * M_TO_CM + MAP_SIZE_CM / 2 - 126.9
+        y_map = pos[1] * M_TO_CM + MAP_SIZE_CM / 2 - 125
+        with self._data_lock:
+            self.pose = (x_map, y_map, yaw + np.pi)
+
+    def _lidar_loop(self):
+        while self._running:
+            if self.connected:
+                try:
+                    with self._sim_lock:
+                        self._read_lidar()
+                except Exception as e:
+                    print(f"[Lidar] error: {e}")
+            time.sleep(0.05)
+
+    def _read_lidar(self):
+        if not self.has_lidar:
+            with self._data_lock:
+                x, y, th = self.pose
+            sc = single_lidar(self._grid_ref, self._dt_ref,
+                               x, y, th, N_LIDAR_RAYS, LIDAR_MAX_CM, PIXELS_PER_CM)
+            with self._data_lock:
+                self.scan = sc
+            return
+
+        try:
+            h_angle   = np.deg2rad(90)
+            start_ang = -h_angle / 2
+            step      =  h_angle / (N_LIDAR_REAL - 1)
+            raw_dist  = []
+            p = start_ang
+            for _ in range(N_LIDAR_REAL):
+                self.sim.setJointPosition(self.lidar_joint, p)
+                p  += step
+                res = self.sim.handleProximitySensor(self.lidar_sensor)
+                raw_dist.append(res[1] * M_TO_CM if (res[0] > 0 and res[1] > 0)
+                                 else LIDAR_MAX_CM)
+
+            raw    = np.array(raw_dist, dtype=np.float32)
+            x_raw  = np.linspace(0, 1, N_LIDAR_REAL)
+            x_full = np.linspace(0, 1, N_LIDAR_RAYS)
+            scan   = np.clip(np.interp(x_full, x_raw, raw), 0.0, LIDAR_MAX_CM)
+            with self._data_lock:
+                self.scan = scan
+        except Exception as e:
+            print("LIDAR ERROR:", e)
+
+    def get_pose(self):
+        with self._data_lock:
+            return self.pose
+
+    def get_scan(self):
+        with self._data_lock:
+            return self.scan.copy()
+
+    def stop(self):
+        self._running = False
+
+
+# ── Visualization ─────────────────────────────────────────────────────────────
+
+def make_figure():
+    fig    = plt.figure(figsize=(14, 7), facecolor='#0d1117')
+    gs     = GridSpec(1, 2, figure=fig, wspace=0.04, width_ratios=[2, 1])
+    ax_map = fig.add_subplot(gs[0])
+    ax_inf = fig.add_subplot(gs[1])
+    for ax in (ax_map, ax_inf):
+        ax.set_facecolor('#0d1117')
+    return fig, ax_map, ax_inf
+
+
+def draw_arrow(ax, x, y, theta, length=10, color='red', lw=2, zorder=6):
+    ax.annotate('',
+        xy=(x + length * np.cos(theta), y + length * np.sin(theta)),
+        xytext=(x, y),
+        arrowprops=dict(arrowstyle='->', color=color, lw=lw),
+        zorder=zorder)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    np.random.seed(0)
+
+    grid = build_map(OBSTACLES_CM, MAP_SIZE_PX, PIXELS_PER_CM)
+    dt   = build_dist_transform(grid)
+
+    CoppeliaInterface._grid_ref = grid
+    CoppeliaInterface._dt_ref   = dt
+
+    map_img = np.zeros((MAP_SIZE_PX, MAP_SIZE_PX, 3), dtype=np.uint8)
+    map_img[grid > 0]  = [45,  105, 160]
+    map_img[grid == 0] = [230, 230, 230]
+
+    coppelia  = CoppeliaInterface()
+    coppelia.start()
+
+    particles = sample_free(grid, MAP_SIZE_CM, PIXELS_PER_CM, N_PARTICLES)
+
+    state = {
+        'it'       : 0,
+        'prev_pose': coppelia.get_pose(),
+        'trail'    : [],
+        'sigma'    : SIGMA_INIT,
     }
 
-    def __init__(self):
-        self._key   = None
-        self._lock  = threading.Lock()
-        self._old   = termios.tcgetattr(sys.stdin)
-        tty.setraw(sys.stdin.fileno())
-        self._thread = threading.Thread(target=self._read_loop, daemon=True)
-        self._thread.start()
+    fig, ax_map, ax_inf = make_figure()
 
-    def _read_loop(self):
-        while True:
-            try:
-                ch = sys.stdin.read(1)
-                if ch == '\x1b':
-                    # Posible secuencia de escape (flechas)
-                    r, _, _ = select.select([sys.stdin], [], [], 0.05)
-                    if r:
-                        ch2 = sys.stdin.read(1)
-                        r2, _, _ = select.select([sys.stdin], [], [], 0.02)
-                        if r2:
-                            ch3 = sys.stdin.read(1)
-                            ch = ch + ch2 + ch3
-                        else:
-                            ch = ch + ch2
-                with self._lock:
-                    self._key = ch
-            except Exception:
-                break
+    def step(_frame):
+        nonlocal particles
 
-    def get_key(self):
-        with self._lock:
-            k = self._key
-            self._key = None
-        return self.KEY_MAP.get(k, None) if k else None
+        ax_map.cla(); ax_inf.cla()
+        ax_map.set_facecolor('#0d1117')
+        ax_inf.set_facecolor('#0d1117')
 
-    def restore(self):
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old)
+        # Odometry delta
+        x_r, y_r, th_r = coppelia.get_pose()
+        px, py, pth    = state['prev_pose']
+        d_trans = np.hypot(x_r - px, y_r - py)
+        d_rot   = (th_r - pth + np.pi) % (2 * np.pi) - np.pi
+        state['prev_pose'] = (x_r, y_r, th_r)
+        state['trail'].append((x_r, y_r))
 
+        # Motion update
+        particles = motion_update(particles, d_trans, d_rot)
+        particles = keep_in_bounds_vectorized(particles, grid, MAP_SIZE_CM, PIXELS_PER_CM)
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  NODO PRINCIPAL
-# ═══════════════════════════════════════════════════════════════════════════
+        # Weight update
+        obs_scan = coppelia.get_scan()
+        sigma    = state['sigma']
+        weights  = score_particles_batch(
+            particles, obs_scan, grid, dt,
+            N_LIDAR_RAYS, LIDAR_MAX_CM, PIXELS_PER_CM, sigma)
 
-class TeleopMCLNode(Node):
+        # Resample
+        neff      = convergence_score(weights)
+        particles = topk_filter_and_resample(
+            particles, weights, grid, MAP_SIZE_CM, PIXELS_PER_CM, TOP_K_FRACTION)
+        particles = keep_in_bounds_vectorized(particles, grid, MAP_SIZE_CM, PIXELS_PER_CM)
 
-    def __init__(self):
-        super().__init__('teleop_mcl')
+        # Pose estimate
+        est_x, est_y, est_th = weighted_mean_pose(particles, weights)
+        err = np.hypot(x_r - est_x, y_r - est_y)
 
-        # ── Publishers ────────────────────────────────────────────────────
-        self.cmd_pub   = self.create_publisher(Twist, 'cmd_vel', 10)
-        self.pose_pub  = self.create_publisher(
-            PoseWithCovarianceStamped, '/mcl/pose', 10)
-        self.image_pub = self.create_publisher(Image, '/aruco/image_detected', 10)
+        # Adaptive sigma
+        state['sigma'] = (max(SIGMA_MIN, sigma * SIGMA_DECAY)
+                          if neff < 0.5 else
+                          min(SIGMA_INIT, sigma * 1.5))
 
-        # ── Subscribers ───────────────────────────────────────────────────
-        qos_img = QoSProfile(
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            history=QoSHistoryPolicy.KEEP_LAST, depth=10)
-        self.create_subscription(Image,   '/image_raw',    self._cb_image, qos_img)
-        self.create_subscription(Float32, 'VelocityEncR', self._cb_encR,
-                                 qos.qos_profile_sensor_data)
-        self.create_subscription(Float32, 'VelocityEncL', self._cb_encL,
-                                 qos.qos_profile_sensor_data)
+        # LIDAR rays overlay
+        half     = np.deg2rad(45)
+        ray_angs = np.linspace(-half, half, N_LIDAR_RAYS) + th_r
+        for dist, rang in zip(obs_scan, ray_angs):
+            ax_map.plot([x_r, x_r + dist * np.cos(rang)],
+                        [y_r, y_r + dist * np.sin(rang)],
+                        color='lime', alpha=0.25, linewidth=0.5, zorder=7)
 
-        # ── Cámara / ArUco ────────────────────────────────────────────────
-        self.bridge    = CvBridge()
-        self.detector  = aruco.ArucoDetector(_aruco_dict, _det_params)
-        self.cam_w, self.cam_h = 320, 180
-        self.obj_pts   = np.array([
-            [-MARKER_SIZE/2,  MARKER_SIZE/2, 0],
-            [ MARKER_SIZE/2,  MARKER_SIZE/2, 0],
-            [ MARKER_SIZE/2, -MARKER_SIZE/2, 0],
-            [-MARKER_SIZE/2, -MARKER_SIZE/2, 0],
-        ], dtype=np.float64)
+        # Map render
+        ax_map.imshow(map_img, extent=[0, MAP_SIZE_CM, 0, MAP_SIZE_CM],
+                      origin='lower', interpolation='nearest')
 
-        self.latest_frame  = None
-        self.latest_header = None
+        w_norm = weights / (weights.max() + 1e-9)
+        sidx   = np.argsort(w_norm)
+        ax_map.scatter(particles[sidx, 0], particles[sidx, 1],
+                       c=plt.cm.plasma(w_norm[sidx]),
+                       s=5, alpha=0.75, zorder=4, linewidths=0)
 
-        # ── Encoders ──────────────────────────────────────────────────────
-        self.wr = Float32()
-        self.wl = Float32()
+        ax_map.plot(est_x, est_y, '*', color='#00e5ff', markersize=13,
+                    zorder=5, markeredgecolor='#0d1117', markeredgewidth=0.8)
+        draw_arrow(ax_map, est_x, est_y, est_th, color='#00e5ff', lw=2, zorder=5)
 
-        # ── Odometría ─────────────────────────────────────────────────────
-        self.odom_x     = 0.0
-        self.odom_y     = 0.0
-        self.odom_theta = 0.0
+        ax_map.plot(x_r, y_r, 'o', color='#ff4d4d', markersize=10,
+                    zorder=6, markeredgecolor='white', markeredgewidth=1.5)
+        draw_arrow(ax_map, x_r, y_r, th_r, color='#ff4d4d', lw=2, zorder=6)
 
-        # ── Filtro de partículas ──────────────────────────────────────────
-        self.pf = ParticleFilter(
-            n_particles  = N_PARTICLES,
-            aruco_map    = ARUCO_MAP,
-            x_min=0.0, x_max=WORLD_X_MAX,
-            y_min=0.0, y_max=WORLD_Y_MAX,
-            alpha1=0.05, alpha2=0.05,
-            alpha3=0.02, alpha4=0.02,
-            sigma_dist   = 0.3,
-            sigma_bearing= 0.25,
-            rand_frac    = 0.05,
-        )
-        self.pf.init_uniform()
-        self.mcl_x, self.mcl_y, self.mcl_theta = self.pf.estimate()
+        ax_map.set_xlim(0, MAP_SIZE_CM); ax_map.set_ylim(0, MAP_SIZE_CM)
+        ax_map.set_xlabel('X (cm)', color='#aaa', fontsize=9)
+        ax_map.set_ylabel('Y (cm)', color='#aaa', fontsize=9)
+        ax_map.tick_params(colors='#666')
+        ax_map.set_title(
+            f'MCL — it {state["it"] + 1}  |  Error: {err:.1f} cm  |  σ={sigma:.1f} cm',
+            color='white', fontsize=10, pad=8)
+        for sp in ax_map.spines.values():
+            sp.set_edgecolor('#333')
 
-        # ── Teleop ────────────────────────────────────────────────────────
-        self.v_cmd = 0.0
-        self.w_cmd = 0.0
-        self.kbd   = KeyboardReader()
+        # Info panel
+        ax_inf.set_xlim(0, 1); ax_inf.set_ylim(0, 1); ax_inf.axis('off')
 
-        # ── Ventana de visualización ──────────────────────────────────────────
-        cv2.namedWindow("MCL - Mapa Pista", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("MCL - Mapa Pista", MAP_W, MAP_H)
+        def txt(x, y, s, **kw):
+            kw.setdefault('color', 'white')
+            kw.setdefault('fontfamily', 'monospace')
+            ax_inf.text(x, y, s, transform=ax_inf.transAxes, **kw)
 
-        # ── Timers ────────────────────────────────────────────────────────
-        self.t_odom   = self.create_timer(1 / 100, self._cb_odom)
-        self.t_main   = self.create_timer(1 /  30, self._cb_main)
+        txt(0.05, 0.97, '── MCL STATUS ──', fontsize=12, color='#00e5ff', fontweight='bold')
+        txt(0.05, 0.91, f'Iteration   : {state["it"] + 1}', fontsize=10)
+        txt(0.05, 0.86, f'Particles   : {N_PARTICLES}',     fontsize=10)
+        txt(0.05, 0.81, f'LIDAR rays  : {N_LIDAR_RAYS}',    fontsize=10)
+        cc = '#6bff9e' if coppelia.connected else '#ffd700'
+        txt(0.05, 0.76,
+            f'Coppelia    : {"YES ✓" if coppelia.connected else "NO (simulated)"}',
+            fontsize=10, color=cc)
+        txt(0.05, 0.71, f'σ current   : {sigma:.1f} cm', fontsize=10, color='#ffd700')
+        txt(0.05, 0.61, f'Top-K frac  : {TOP_K_FRACTION}', fontsize=10, color='#ffd700')
 
-        self._t_odom_last = self.get_clock().now()
+        txt(0.05, 0.53, '── GROUND TRUTH ──', fontsize=11, color='#ff6b6b', fontweight='bold')
+        txt(0.05, 0.47, f'x  = {x_r:7.1f} cm',             fontsize=10)
+        txt(0.05, 0.42, f'y  = {y_r:7.1f} cm',             fontsize=10)
+        txt(0.05, 0.37, f'θ  = {np.rad2deg(th_r):7.1f} °', fontsize=10)
 
-        self.get_logger().info(
-            "TeleopMCL iniciado\n"
-            "  W/S/A/D o flechas : mover\n"
-            "  ESPACIO           : detener\n"
-            "  R                 : reinicializar MCL\n"
-            "  Q / ESC           : salir"
-        )
+        txt(0.05, 0.29, '── MCL ESTIMATE ──', fontsize=11, color='#00e5ff', fontweight='bold')
+        txt(0.05, 0.23, f'x̂  = {est_x:7.1f} cm',             fontsize=10)
+        txt(0.05, 0.18, f'ŷ  = {est_y:7.1f} cm',             fontsize=10)
+        txt(0.05, 0.13, f'θ̂  = {np.rad2deg(est_th):7.1f} °', fontsize=10)
 
-    # ── Callbacks de sensores ───────────────────────────────────────────────
+        ec = '#ff4d4d' if err > 20 else ('#ffd700' if err > 8 else '#6bff9e')
+        txt(0.05, 0.05, f'Error : {err:.1f} cm', fontsize=13, color=ec, fontweight='bold')
 
-    def _cb_image(self, msg: Image):
-        try:
-            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-            self.latest_frame  = cv2.resize(frame, (self.cam_w, self.cam_h))
-            self.latest_header = msg.header
-        except Exception as e:
-            self.get_logger().error(f'image cb: {e}')
+        state['it'] += 1
 
-    def _cb_encR(self, msg: Float32): self.wr = msg
-    def _cb_encL(self, msg: Float32): self.wl = msg
+    plt.suptitle('MCL — Differential Robot + LIDAR', color='#aaa', fontsize=9, y=0.998)
+    plt.tight_layout(rect=[0, 0, 1, 0.998])
 
-    # ── Odometría ───────────────────────────────────────────────────────────
-
-    def _cb_odom(self):
-        now = self.get_clock().now()
-        dt  = (now - self._t_odom_last).nanoseconds * 1e-9
-        self._t_odom_last = now
-        if dt <= 0 or dt > 0.5:
-            return
-
-        vr = WHEEL_RADIUS * self.wr.data
-        vl = WHEEL_RADIUS * self.wl.data
-        v  = (vr + vl) / 2.0
-        w  = (vr - vl) / WHEEL_BASE
-
-        self.odom_x     += v * math.cos(self.odom_theta) * dt
-        self.odom_y     += v * math.sin(self.odom_theta) * dt
-        self.odom_theta  = wrap(self.odom_theta + w * dt)
-
-        # Predicción del filtro de partículas con nueva odometría
-        self.pf.predict_from_odom(self.odom_x, self.odom_y, self.odom_theta)
-
-    # ── Ciclo principal (ArUcos + MCL + teleop + visualización) ─────────────
-
-    def _cb_main(self):
-        # ── 1. Teclado ───────────────────────────────────────────────────
-        key = self.kbd.get_key()
-        if key == 'QUIT':
-            self._shutdown()
-            return
-        if key == 'RESET':
-            self.pf.init_uniform()
-            self.get_logger().info('MCL reinicializado (distribución uniforme)')
-        if key == 'UP':
-            self.v_cmd, self.w_cmd =  VEL_LINEAR, 0.0
-        elif key == 'DOWN':
-            self.v_cmd, self.w_cmd = -VEL_LINEAR, 0.0
-        elif key == 'LEFT':
-            self.v_cmd, self.w_cmd = 0.0,  VEL_ANGULAR
-        elif key == 'RIGHT':
-            self.v_cmd, self.w_cmd = 0.0, -VEL_ANGULAR
-        elif key == 'STOP':
-            self.v_cmd, self.w_cmd = 0.0, 0.0
-
-        cmd = Twist()
-        cmd.linear.x  = self.v_cmd
-        cmd.angular.z = self.w_cmd
-        self.cmd_pub.publish(cmd)
-
-        # ── 2. Procesar ArUcos ───────────────────────────────────────────
-        visible_ids = []
-        observations = []   # [(id, dist_m, bearing_rad)]
-        aruco_poses  = []   # [(x, y, theta)] para inicialización
-
-        if self.latest_frame is not None:
-            frame = self.latest_frame.copy()
-            gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            corners, ids, _ = self.detector.detectMarkers(gray)
-
-            if ids is not None and len(ids) > 0:
-                aruco.drawDetectedMarkers(frame, corners, ids)
-
-                for m_idx in range(len(corners)):
-                    pts = np.squeeze(corners[m_idx])
-                    if pts.shape != (4, 2):
-                        continue
-
-                    mid = int(ids[m_idx][0])
-                    visible_ids.append(mid)
-
-                    cx_m = int(np.mean(pts[:, 0]))
-                    cy_m = int(np.mean(pts[:, 1]))
-                    cv2.circle(frame, (cx_m, cy_m), 5, (0, 255, 0), -1)
-
-                    img_pts = pts.astype(np.float64)
-                    ok, rvec, tvec = cv2.solvePnP(
-                        self.obj_pts, img_pts,
-                        CAMERA_MATRIX, DIST_COEFFS,
-                        flags=cv2.SOLVEPNP_IPPE_SQUARE
-                    )
-
-                    if ok:
-                        result = estimate_robot_pose_aruco(tvec, rvec, mid, pts)
-                        cv2.drawFrameAxes(frame, CAMERA_MATRIX, DIST_COEFFS,
-                                          rvec, tvec, MARKER_SIZE * 0.6)
-
-                        if result is not None:
-                            rx, ry, rth, dist_h, bearing = result
-                            aruco_poses.append((rx, ry, rth))
-
-                            # Observación para el filtro de partículas
-                            # bearing en frame del robot
-                            observations.append((mid, dist_h, bearing))
-
-                            col = (0, 255, 0)
-                            cv2.putText(frame,
-                                f"#{mid} d={dist_h:.2f}m b={math.degrees(bearing):.0f}°",
-                                (int(pts[0][0]), int(pts[0][1]) - 18),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
-                            cv2.putText(frame,
-                                f"x={rx:.2f} y={ry:.2f} th={math.degrees(rth):.0f}°",
-                                (int(pts[0][0]), int(pts[0][1]) - 4),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 0), 1)
-                        else:
-                            t = tvec.flatten()
-                            cv2.putText(frame, f"#{mid} (no en mapa)",
-                                        (cx_m - 20, cy_m - 10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 165, 255), 1)
-                    else:
-                        cv2.putText(frame, f"#{mid} solvePnP fail",
-                                    (cx_m - 20, cy_m - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 0, 255), 1)
-            else:
-                cv2.putText(frame, 'No ArUco', (8, 24),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-
-            # ── 3. Actualizar MCL con observaciones ──────────────────────
-            if observations:
-                # Primera vez con ArUco: inicializar el filtro cerca de la medición
-                if not self.pf.initialized or \
-                   (np.allclose(self.pf._estimate, 0) and aruco_poses):
-                    avg_x = float(np.mean([p[0] for p in aruco_poses]))
-                    avg_y = float(np.mean([p[1] for p in aruco_poses]))
-                    sins  = [math.sin(p[2]) for p in aruco_poses]
-                    coss  = [math.cos(p[2]) for p in aruco_poses]
-                    avg_th = math.atan2(np.mean(sins), np.mean(coss))
-                    self.pf.init_at(avg_x, avg_y, avg_th)
-                    self.pf.reset_odom(self.odom_x, self.odom_y, self.odom_theta)
-
-                self.pf.update(observations)
-
-            self.mcl_x, self.mcl_y, self.mcl_theta = self.pf.estimate()
-
-            # ── 4. Publicar pose MCL ─────────────────────────────────────
-            self._publish_mcl_pose()
-
-            # ── 5. Overlay HUD en imagen ─────────────────────────────────
-            cv2.putText(frame,
-                f"MCL x={self.mcl_x:.2f} y={self.mcl_y:.2f} "
-                f"th={math.degrees(self.mcl_theta):.0f}deg",
-                (4, self.cam_h - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, C_ROBOT_MCL, 1)
-
-            cmd_txt = (f"v={self.v_cmd:+.2f} w={self.w_cmd:+.2f}"
-                       f"  Neff={self.pf.neff:.0f}/{N_PARTICLES}")
-            cv2.putText(frame, cmd_txt, (4, 14),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1)
-
-            # Publicar imagen
-            try:
-                out = self.bridge.cv2_to_imgmsg(frame, encoding='bgr8')
-                if self.latest_header:
-                    out.header = self.latest_header
-                self.image_pub.publish(out)
-            except Exception as e:
-                self.get_logger().error(f'img pub: {e}')
-        else:
-            # Sin frame: al menos predecir con odometría ya sucedió en _cb_odom
-            self.mcl_x, self.mcl_y, self.mcl_theta = self.pf.estimate()
-
-        # ── 6. Mapa top-down ─────────────────────────────────────────────
-        mapa = draw_map(
-            self.odom_x, self.odom_y, self.odom_theta,
-            self.mcl_x,  self.mcl_y,  self.mcl_theta,
-            self.pf.particles,
-            visible_ids,
-        )
-
-        # Mostrar controles en el mapa
-        controls = [
-            "W/S: adelante/atras",
-            "A/D: girar",
-            "ESPACIO: parar",
-            "R: reinicializar MCL",
-            "Q/ESC: salir",
-        ]
-        for i, txt in enumerate(controls):
-            cv2.putText(mapa, txt, (MAP_W - 190, 80 + i * 14),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.30, (150, 150, 150), 1)
-
-        neff_ratio = self.pf.neff / N_PARTICLES
-        bar_w = int(160 * neff_ratio)
-        cv2.rectangle(mapa, (MAP_W - 190, 68), (MAP_W - 190 + 160, 76), (50,50,50), -1)
-        cv2.rectangle(mapa, (MAP_W - 190, 68), (MAP_W - 190 + bar_w, 76),
-                      (int(255*(1-neff_ratio)), int(255*neff_ratio), 50), -1)
-        cv2.putText(mapa, f"Neff {self.pf.neff:.0f}/{N_PARTICLES}",
-                    (MAP_W - 190, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.30, (160,160,160), 1)
-
-        cv2.imshow("MCL - Mapa Pista", mapa)   # mismo nombre, sin em-dash
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            self._shutdown()
-
-    # ── Publicar pose ───────────────────────────────────────────────────────
-
-    def _publish_mcl_pose(self):
-        msg = PoseWithCovarianceStamped()
-        msg.header.stamp    = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'map'
-        msg.pose.pose.position.x    = self.mcl_x
-        msg.pose.pose.position.y    = self.mcl_y
-        msg.pose.pose.orientation.z = math.sin(self.mcl_theta / 2)
-        msg.pose.pose.orientation.w = math.cos(self.mcl_theta / 2)
-        P = self.pf.particles
-        if P is not None:
-            msg.pose.covariance[0]  = float(np.var(P[:, 0]))
-            msg.pose.covariance[7]  = float(np.var(P[:, 1]))
-            msg.pose.covariance[35] = float(np.var(P[:, 2]))
-        self.pose_pub.publish(msg)
-
-    # ── Cierre limpio ───────────────────────────────────────────────────────
-
-    def _shutdown(self):
-        stop = Twist()
-        self.cmd_pub.publish(stop)
-        self.kbd.restore()
-        cv2.destroyAllWindows()
-        self.get_logger().info('TeleopMCL apagado.')
-        rclpy.shutdown()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-def main(args=None):
-    rclpy.init(args=args)
-    node = TeleopMCLNode()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        try:
-            node._shutdown()
-        except Exception:
-            pass
-        if rclpy.ok():
-            rclpy.shutdown()
+    FuncAnimation(fig, step, interval=30, cache_frame_data=False)
+    plt.show()
+    coppelia.stop()
 
 
 if __name__ == '__main__':
