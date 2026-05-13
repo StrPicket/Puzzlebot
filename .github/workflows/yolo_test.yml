@@ -1,4 +1,4 @@
-name: YOLOv8 Segmentation Test
+name: YOLOv8 Test
 
 on:
   push:
@@ -6,11 +6,11 @@ on:
       - main
 
 jobs:
-  test-yolo:
+  yolo-test:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout repository
+    - name: Checkout repo
       uses: actions/checkout@v4
 
     - name: Setup Python
@@ -22,12 +22,12 @@ jobs:
       run: |
         pip install ultralytics opencv-python
 
-    - name: Run segmentation test
+    - name: Run YOLO test
       run: |
-        python ros2_ws8/src/yolov8_detection/yolov8_detection/segmentation_test.py > detection_results.txt
+        python yolov8_detection/yolov8_detection/github_test.py
 
-    - name: Upload detection results
+    - name: Upload results
       uses: actions/upload-artifact@v4
       with:
-        name: yolo-results
+        name: detection-results
         path: detection_results.txt
