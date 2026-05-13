@@ -1,13 +1,16 @@
+import os
+print(os.getcwd())
+
 from ultralytics import YOLO
 import cv2
 import sys
 
 try:
     # Load model
-    model = YOLO("yolov8_detection/models/best.pt")
+    model = YOLO("src/yolov8_detection/models/best.pt")
 
     # Load test image
-    image_path = "test.jpg"
+    image_path = "test.jpeg"
     image = cv2.imread(image_path)
 
     if image is None:
