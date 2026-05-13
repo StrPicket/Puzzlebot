@@ -7,7 +7,7 @@ import sys
 
 try:
     # Load model
-    model = YOLO("src/yolov8_detection/models/best.pt")
+    model = YOLO("yolov8_detection/models/best.pt")
 
     # Load test image
     image_path = "test.jpeg"
