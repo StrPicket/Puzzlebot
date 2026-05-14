@@ -32,6 +32,7 @@ setup(
             'poseEstimation = basic_comms.poseEstimation:main',
             'monteCarlo = basic_comms.monteCarlo:main',
             'particle_filter = basic_comms.particle_filter:main',
+            'slam_teleop = basic_comms.slam_teleop:main',
         ],
     },
 )
