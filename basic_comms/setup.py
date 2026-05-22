@@ -34,6 +34,7 @@ setup(
             'particle_filter = basic_comms.particle_filter:main',
             'slam_teleop = basic_comms.slam_teleop:main',
 	    'mapeo = basic_comms.mapeo:main',
+	    'evasionBug = basic_comms.evasionBug:main',
         ],
     },
 )
