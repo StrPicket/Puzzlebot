@@ -1,601 +1,656 @@
 #!/usr/bin/env python3
 """
-mapeo.py  --  corre en la LAPTOP
-Suscribe : /scan  (sensor_msgs/LaserScan)
-           /odom  (nav_msgs/Odometry)
-Publica  : /map   (nav_msgs/OccupancyGrid)  compatible con RViz2
+slam_node.py  --  corre en la LAPTOP
+══════════════════════════════════════════════════════════════════════
+SLAM 2D con filtro de partículas (estilo CoreSLAM/BreezySLAM)
 
-FIXES:
-  1. origin_x / origin_y centrados para que el robot arranque en el centro del mapa
-  2. range_max ignorado correctamente (no marca celdas libres hasta el infinito)
-  3. Logs de debug para verificar que llegan datos
+Pipeline (ver slides Semana 3):
+  1. Recibe scan LIDAR  →  /scan
+  2. Recibe odometría   →  /odom  (publicada por slam_odom.py en la Jetson)
+  3. Predice partículas con dead reckoning (motion model)
+  4. Puntúa partículas comparando scan contra mapa actual
+  5. Remuestrea partículas (las malas mueren, las buenas se replican)
+  6. La mejor partícula actualiza el mapa (stitching / ray casting)
+  7. Publica: /slam/pose, /slam/map, /slam/particles, TF map→odom
+
+Suscripciones
+─────────────
+  /scan   sensor_msgs/LaserScan
+  /odom   nav_msgs/Odometry
+
+Publicaciones
+─────────────
+  /slam/pose       geometry_msgs/PoseWithCovarianceStamped
+  /slam/map        nav_msgs/OccupancyGrid   (mapa que se va construyendo)
+  /slam/particles  geometry_msgs/PoseArray  (ver en rviz)
+  TF dinámico:  map → odom
+
+Requisitos
+──────────
+  pip3 install numpy opencv-python --break-system-packages
+  ros-humble: nav_msgs geometry_msgs sensor_msgs tf2_ros
+
+Parámetros ajustables (sección CONFIG abajo)
+────────────────────────────────────────────
+  N_PARTICLES    número de partículas (50–500)
+  MAP_SIZE_M     tamaño del mapa cuadrado en metros
+  MAP_RES        resolución del mapa en metros/celda
+  SIGMA_XY       ruido de posición en el motion model (m)
+  SIGMA_THETA    ruido de ángulo en el motion model (rad)
+  SIGMA_HIT      std del modelo de sensor (m) — qué tan "preciso" es el LIDAR
+  P_HIT          peso del rayo que toca obstáculo
+  P_RAND         peso del rayo aleatorio (ruido)
+  LIDAR_MAX_M    rango máximo del LIDAR en metros
+  LIDAR_MIN_M    rango mínimo del LIDAR en metros
+  N_RAYS         cuántos rayos del scan usar (submuestreo para velocidad)
 """
 
 import math
-import random
+import time
 import numpy as np
+import cv2
 
 import rclpy
+from rclpy import qos as ros_qos
 from rclpy.node import Node
-from rclpy import qos
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
+from geometry_msgs.msg import (PoseWithCovarianceStamped, PoseArray,
+                                Pose, TransformStamped)
+from nav_msgs.msg import Odometry, OccupancyGrid, MapMetaData
 from sensor_msgs.msg import LaserScan
-from nav_msgs.msg    import OccupancyGrid, Odometry
-from std_msgs.msg    import Header
-from tf2_ros import TransformBroadcaster, StaticTransformBroadcaster, TransformStamped
-
-
-# ---------------------------------------------------------------------------
-# Bresenham
-# ---------------------------------------------------------------------------
-
-def bresenham(x0: int, y0: int, x1: int, y1: int):
-    cells = []
-    dx =  abs(x1 - x0);  sx = 1 if x0 < x1 else -1
-    dy = -abs(y1 - y0);  sy = 1 if y0 < y1 else -1
-    err = dx + dy
-
-    while True:
-        if x0 == x1 and y0 == y1:
-            break
-        cells.append((x0, y0))
-        e2 = 2 * err
-        if e2 >= dy:
-            if x0 == x1:
-                break
-            err += dy;  x0 += sx
-        if e2 <= dx:
-            if y0 == y1:
-                break
-            err += dx;  y0 += sy
-
-    return cells
-
-class Particle:
-
-    def __init__(self, x=0.0, y=0.0, theta=0.0):
-        self.x = x
-        self.y = y
-        self.theta = theta
-        self.weight = 1.0
-
-# ---------------------------------------------------------------------------
-# Nodo principal
-# ---------------------------------------------------------------------------
-
-class OccupancyGridNode(Node):
-
-    def __init__(self):
-        super().__init__('occupancy_grid_node')
-
-        self.tf_broadcaster = TransformBroadcaster(self)
-        self.static_tf_broadcaster = StaticTransformBroadcaster(self) # base_link → laser (estático)
-        self.publish_static_laser_tf()
-        self.robot_yaw = 0.0
-        self.prev_map_x = 0.0
-        self.prev_map_y = 0.0
-        self.prev_map_theta = 0.0
-
-        # ------------------------------------------------------------------ #
-        # Particle Filter
-        # ------------------------------------------------------------------ #
-
-        self.num_particles = 500
-
-        self.particles = [
-            Particle(
-                random.gauss(0.0, 0.05),
-                random.gauss(0.0, 0.05),
-                random.gauss(0.0, 0.03)
-            )
-            for _ in range(self.num_particles)
-        ]
-
-        self.last_odom_x = 0.0
-        self.last_odom_y = 0.0
-        self.last_odom_yaw = 0.0
-
-        # ------------------------------------------------------------------ #
-        # Parámetros del mapa
-        # ------------------------------------------------------------------ #
-        self.resolution = 0.05    # metros por celda  (5 cm)
-        self.width_m    = 5.591       # ancho total del mapa en metros  ← más grande para no salirse
-        self.height_m   = 3.788       # alto  total del mapa en metros
-
-        self.l_occ  =  0.7
-        self.l_free = -0.4
-        self.l_min  = -5.0
-        self.l_max  =  5.0
-
-        self.range_min_threshold = 0.10   # metros — ignora lecturas muy cercanas
-        # ------------------------------------------------------------------ #
-
-        self.cols = int(self.width_m  / self.resolution)
-        self.rows = int(self.height_m / self.resolution)
-
-        # FIX 1: origen centrado — el robot arranca en (0,0) y el mapa
-        # tiene espacio en todas las direcciones
-        self.origin_x = -(self.width_m  / 2.0)   # esquina inferior izquierda
-        self.origin_y = -(self.height_m / 2.0)
-
-        self.logodds = np.zeros((self.rows, self.cols), dtype=np.float32)
-
-        self.robot_x   = 0.0
-        self.robot_y   = 0.0
-        self.robot_yaw = 0.0
-        self.odom_ok   = False
+from tf2_ros import TransformBroadcaster
+from builtin_interfaces.msg import Time as RosTime
 
-        # Contadores para debug
-        self._scan_count = 0
-        self._odom_count = 0
 
-        # Publisher
-        self.map_pub = self.create_publisher(OccupancyGrid, 'map', 10)
-
-        # Subscriptions
-        self.sub_scan = self.create_subscription(
-            LaserScan, 'scan', self.scan_cb,
-            qos.qos_profile_sensor_data)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONFIG
+# ═══════════════════════════════════════════════════════════════════════════════
 
-        self.sub_odom = self.create_subscription(
-            Odometry, 'odom', self.odom_cb,
-            qos.qos_profile_sensor_data)
-
-        # Mapa a 1 Hz
-        self.create_timer(1.0, self.publish_map)
-
-        # Timers TF
-        self.create_timer(0.1, self.publish_tf)
-
-        # Log de estado cada 5 s
-        self.create_timer(5.0, self._status_log)
-
-        self.get_logger().info(
-            f'occupancy_grid_node listo  '
-            f'({self.cols}x{self.rows} celdas, {self.resolution*100:.0f} cm/celda)\n'
-            f'Mapa: {self.width_m}x{self.height_m} m  '
-            f'origen: ({self.origin_x:.2f}, {self.origin_y:.2f}) m\n'
-            f'El robot debe arrancar en (0,0) en odom para quedar centrado.'
-        )
-
-    # ---------------------------------------------------------------------- #
-    # Odometría
-    # ---------------------------------------------------------------------- #
-
-    def odom_cb(self, msg: Odometry):
-
-        new_x = msg.pose.pose.position.x
-        new_y = msg.pose.pose.position.y
-
-        q = msg.pose.pose.orientation
-
-        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-
-        new_yaw = math.atan2(siny_cosp, cosy_cosp)
-
-        # ---------------------------------------------------------------
-        # Delta odometría
-        # ---------------------------------------------------------------
-
-        dx = new_x - self.last_odom_x
-        dy = new_y - self.last_odom_y
-
-        dtheta = math.atan2(
-            math.sin(new_yaw - self.last_odom_yaw),
-            math.cos(new_yaw - self.last_odom_yaw)
-        )
-
-        self.last_odom_x = new_x
-        self.last_odom_y = new_y
-        self.last_odom_yaw = new_yaw
-
-        # ---------------------------------------------------------------
-        # Ignorar micro movimiento
-        # ---------------------------------------------------------------
-
-        motion = abs(dx) + abs(dy) + abs(dtheta)
-
-        if motion < 0.0005:
-            noise_enabled = False
-        else:
-            noise_enabled = True
-
-        # ---------------------------------------------------------------
-        # Motion model MCL
-        # ---------------------------------------------------------------
-        dist = math.sqrt(dx**2 + dy**2)
-
-        for p in self.particles:
-
-            if noise_enabled:
-                noise_x = random.gauss(0.0, 0.0005)
-                noise_y = random.gauss(0.0, 0.0005)
-                noise_theta = random.gauss(0.0, 0.003)
-            else:
-                noise_x = 0.0
-                noise_y = 0.0
-                noise_theta = 0.0
-
-            # movimiento relativo
-            p.x     += dist * math.cos(p.theta) + noise_x
-            p.y     += dist * math.sin(p.theta) + noise_y
-            p.theta += dtheta + random.gauss(0, 0.003)
-
-            # normalizar theta
-            p.theta = math.atan2(
-                math.sin(p.theta),
-                math.cos(p.theta)
-            )
-
-        # ---------------------------------------------------------------
-        # Mejor partícula temporal
-        # ---------------------------------------------------------------
-
-        self.robot_x = sum(p.x * p.weight for p in self.particles)
-        self.robot_y = sum(p.y * p.weight for p in self.particles)
-
-        sin_sum = sum(math.sin(p.theta) * p.weight for p in self.particles)
-        cos_sum = sum(math.cos(p.theta) * p.weight for p in self.particles)
-
-        self.robot_yaw = math.atan2(sin_sum, cos_sum)
-
-        self.odom_ok = True
-        self._odom_count += 1
-
-    # ---------------------------------------------------------------------- #
-    # Scan
-    # ---------------------------------------------------------------------- #
-
-    def scan_cb(self, msg: LaserScan):
-
-        if not self.odom_ok:
-            return
-
-        # ===============================================================
-        # MCL UPDATE
-        # ===============================================================
-
-        for p in self.particles:
-            p.weight = self.compute_particle_weight(p, msg)
-
-        self.normalize_weights()
-        self.resample_particles()
-
-        best = max(self.particles, key=lambda p: p.weight)
-
-        self.robot_x = best.x
-        self.robot_y = best.y
-        self.robot_yaw = best.theta
-
-        # ===============================================================
-        # MOVEMENT GATING
-        # ===============================================================
-
-        dx = self.robot_x - self.prev_map_x
-        dy = self.robot_y - self.prev_map_y
-
-        dist_moved = math.sqrt(dx * dx + dy * dy)
-
-        angle_moved = abs(
-            math.atan2(
-                math.sin(self.robot_yaw - self.prev_map_theta),
-                math.cos(self.robot_yaw - self.prev_map_theta)
-            )
-        )
-
-        # ---------------------------------------------------------------
-        # NO mapear durante giros grandes
-        # ---------------------------------------------------------------
-
-        if angle_moved > 0.12:
-            return
-
-        # ---------------------------------------------------------------
-        # Detectar movimiento estable
-        # ---------------------------------------------------------------
-
-        moving_straight = (
-            dist_moved > 0.02 and
-            angle_moved < 0.05
-        )
-
-        robot_still = (
-            dist_moved < 0.01 and
-            angle_moved < 0.02
-        )
-
-        if not (moving_straight or robot_still):
-            return
-
-        # ===============================================================
-        # MAP UPDATE
-        # ===============================================================
-
-        rx = self.robot_x
-        ry = self.robot_y
-        ryaw = self.robot_yaw
-
-        robot_col, robot_row = self._world_to_cell(rx, ry)
-
-        if not self._in_bounds(robot_col, robot_row):
-            self.get_logger().warn(
-                f'Robot fuera del grid: ({rx:.2f}, {ry:.2f})',
-                throttle_duration_sec=5.0
-            )
-            return
-
-        angle = msg.angle_min
-
-        # ---------------------------------------------------------------
-        # Scan subsampling
-        # ---------------------------------------------------------------
-
-        for i in range(0, len(msg.ranges), 4):
-
-            dist = msg.ranges[i]
-
-            if math.isnan(dist) or math.isinf(dist):
-                angle += msg.angle_increment * 2
+N_PARTICLES = 200         # número de partículas
+
+# Mapa
+MAP_SIZE_X  = 6         # metros — ancho del mapa
+MAP_SIZE_Y  = 4.5         # metros — alto del mapa
+MAP_RES     = 0.05        # metros por celda
+
+# Motion model — ruido gaussiano en la predicción de partículas
+SIGMA_XY    = 0.03        # m    — más alto = partículas más dispersas
+SIGMA_THETA = 0.02        # rad
+
+# Sensor model — cómo puntuar un scan contra el mapa
+SIGMA_HIT   = 0.15        # m   — std de la gaussiana de coincidencia
+P_HIT       = 0.85        # peso del término "rayo toca obstáculo"
+P_RAND      = 0.05        # peso del término "rayo aleatorio"
+# P_MAX = 1 - P_HIT - P_RAND  → peso del término "rayo sin retorno"
+
+# LIDAR
+LIDAR_MAX_M = 12.0        # metros — descartar rayos más largos
+LIDAR_MIN_M = 0.10        # metros — descartar rayos muy cortos
+N_RAYS      = 60          # cuántos rayos usar por scan (submuestreo)
+
+# Mapa de ocupación: umbral para considerar una celda ocupada
+OCC_THRESH  = 50          # 0–100 en OccupancyGrid
+
+# Valor de ocupación que se añade al mapa en cada hit/miss (CoreSLAM style)
+LOG_OCC_HIT  =  15        # aumenta probabilidad de ocupado
+LOG_OCC_MISS = -5         # disminuye probabilidad de ocupado
+LOG_OCC_MAX  =  100
+LOG_OCC_MIN  = -100
+
+# Ventana de visualización OpenCV
+SHOW_MAP = False           # False si corres en headless
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  UTILIDADES GEOMÉTRICAS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def wrap(a: float) -> float:
+    """Normaliza ángulo a [-π, π]."""
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+def yaw_to_quat(yaw: float):
+    cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
+    return 0.0, 0.0, sy, cy
+
+
+def quat_to_yaw(qz: float, qw: float) -> float:
+    return 2.0 * math.atan2(qz, qw)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAPA DE OCUPACIÓN (log-odds, estilo CoreSLAM)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class OccupancyMap:
+    """
+    Mapa 2D en log-odds.
+
+    Internamente usa un array int16 de log-odds escalados.
+    Para publicar en ROS se convierte a OccupancyGrid (0-100, -1=desconocido).
+
+    El origen del mapa (celda [0,0]) corresponde a la coordenada global
+    (-MAP_SIZE_M/2, -MAP_SIZE_M/2).  El robot arranca en el centro del mapa.
+    """
+
+    def __init__(self, size_x: float, size_y: float, res: float):
+        self.res    = res                                # m / celda
+        self.size_x = size_x
+        self.size_y = size_y
+        self.cells_x = int(size_x / res)
+        self.cells_y = int(size_y / res)
+        self.origin_x = 0.0      # esquina inferior izquierda del mapa real
+        self.origin_y = 0.0
+        self.logodds = np.zeros((self.cells_y, self.cells_x), dtype=np.int16)
+
+    # ── Conversión coordenadas globales ↔ celda ─────────────────────────────
+    def world_to_cell(self, wx: float, wy: float):
+        cx = int((wx - self.origin_x) / self.res)
+        cy = int((wy - self.origin_y) / self.res)
+        return cx, cy
+
+    def cell_to_world(self, cx: int, cy: int):
+        wx = cx * self.res + self.origin_x + self.res / 2.0
+        wy = cy * self.res + self.origin_y + self.res / 2.0
+        return wx, wy
+
+    def in_bounds(self, cx: int, cy: int) -> bool:
+        return 0 <= cx < self.cells_x and 0 <= cy < self.cells_y
+
+    # ── Actualizar mapa con un scan (ray casting Bresenham) ─────────────────
+    def update(self, robot_x: float, robot_y: float, robot_theta: float,
+               scan_ranges: np.ndarray, scan_angles: np.ndarray):
+        """
+        Para cada rayo válido:
+          - Traza la línea desde el robot hasta el punto de impacto con Bresenham.
+          - Celdas en la línea (excepto la última) → miss  (LOG_OCC_MISS)
+          - Celda de impacto → hit  (LOG_OCC_HIT)
+        """
+        rx, ry = robot_x, robot_y
+        crx, cry = self.world_to_cell(rx, ry)
+
+        for i, r in enumerate(scan_ranges):
+            if not (LIDAR_MIN_M < r < LIDAR_MAX_M):
                 continue
+            angle = robot_theta + scan_angles[i]
+            hit_x = rx + r * math.cos(angle)
+            hit_y = ry + r * math.sin(angle)
+            chx, chy = self.world_to_cell(hit_x, hit_y)
 
-            if dist < self.range_min_threshold:
-                angle += msg.angle_increment * 2
-                continue
+            # Bresenham sobre el rayo
+            cells_on_ray = self._bresenham(crx, cry, chx, chy)
 
-            # limitar rango útil
-            dist = min(dist, 3.0)
+            # Celdas previas al impacto → libre
+            for (cx, cy) in cells_on_ray[:-1]:
+                if self.in_bounds(cx, cy):
+                    self.logodds[cy, cx] = max(
+                        self.logodds[cy, cx] + LOG_OCC_MISS, LOG_OCC_MIN)
 
-            hit = dist < (msg.range_max - 0.05)
+            # Celda de impacto → ocupada
+            if self.in_bounds(chx, chy):
+                self.logodds[chy, chx] = min(
+                    self.logodds[chy, chx] + LOG_OCC_HIT, LOG_OCC_MAX)
 
-            world_angle = ryaw + angle
+    @staticmethod
+    def _bresenham(x0, y0, x1, y1):
+        """Devuelve lista de celdas (x,y) entre (x0,y0) y (x1,y1)."""
+        cells = []
+        dx, dy = abs(x1 - x0), abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+        x, y = x0, y0
+        while True:
+            cells.append((x, y))
+            if x == x1 and y == y1:
+                break
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x   += sx
+            if e2 < dx:
+                err += dx
+                y   += sy
+        return cells
 
-            hit_x = rx + dist * math.cos(world_angle)
-            hit_y = ry + dist * math.sin(world_angle)
+    # ── Consulta: valor de ocupación en una coordenada global ───────────────
+    def get_occ(self, wx: float, wy: float) -> float:
+        """Devuelve probabilidad de ocupación [0,1]. 0.5 si desconocido."""
+        cx, cy = self.world_to_cell(wx, wy)
+        if not self.in_bounds(cx, cy):
+            return 0.5
+        lo = float(self.logodds[cy, cx])
+        # log-odds → probabilidad: p = 1/(1+exp(-lo/10))
+        return 1.0 / (1.0 + math.exp(-lo / 10.0))
 
-            hit_col, hit_row = self._world_to_cell(hit_x, hit_y)
-
-            # -----------------------------------------------------------
-            # FREE CELLS
-            # -----------------------------------------------------------
-
-            for col, row in bresenham(
-                robot_col,
-                robot_row,
-                hit_col,
-                hit_row
-            ):
-
-                if self._in_bounds(col, row):
-
-                    self.logodds[row, col] = np.clip(
-                        self.logodds[row, col] + self.l_free,
-                        self.l_min,
-                        self.l_max
-                    )
-
-            # -----------------------------------------------------------
-            # OCCUPIED CELL
-            # -----------------------------------------------------------
-
-            if hit and self._in_bounds(hit_col, hit_row):
-
-                self.logodds[hit_row, hit_col] = np.clip(
-                    self.logodds[hit_row, hit_col] + self.l_occ,
-                    self.l_min,
-                    self.l_max
-                )
-
-            angle += msg.angle_increment * 2
-
-        # ===============================================================
-        # STORE PREVIOUS MAP POSE
-        # ===============================================================
-
-        self.prev_map_x = self.robot_x
-        self.prev_map_y = self.robot_y
-        self.prev_map_theta = self.robot_yaw
-
-        self._scan_count += 1
-
-    # ---------------------------------------------------------------------- #
-    # Publicar mapa
-    # ---------------------------------------------------------------------- #
-
-    def publish_map(self):
+    # ── Convertir a OccupancyGrid de ROS ────────────────────────────────────
+    def to_ros_msg(self, stamp, frame_id: str) -> OccupancyGrid:
         msg = OccupancyGrid()
-        msg.header.stamp    = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'map'
-
-        msg.info.resolution = self.resolution
-        msg.info.width      = self.cols
-        msg.info.height     = self.rows
-        # CRÍTICO: origin debe coincidir con self.origin_x/y
-        msg.info.origin.position.x    = self.origin_x
-        msg.info.origin.position.y    = self.origin_y
-        msg.info.origin.position.z    = 0.0
+        msg.header.stamp    = stamp
+        msg.header.frame_id = frame_id
+        msg.info.resolution = self.res
+        msg.info.width      = self.cells_x
+        msg.info.height     = self.cells_y
+        msg.info.origin.position.x = self.origin_x
+        msg.info.origin.position.y = self.origin_y
         msg.info.origin.orientation.w = 1.0
 
-        prob     = 1.0 - 1.0 / (1.0 + np.exp(self.logodds))
-        grid_int = np.full((self.rows, self.cols), -1, dtype=np.int8)
-        known    = self.logodds != 0.0
-        grid_int[known] = (prob[known] * 100).astype(np.int8)
+        # Convertir log-odds a 0-100 (-1 = desconocido)
+        data = np.full((self.cells_y, self.cells_x), -1, dtype=np.int8)
+        known = self.logodds != 0
+        # probabilidad de ocupación
+        prob = 1.0 / (1.0 + np.exp(-self.logodds[known].astype(np.float32) / 10.0))
+        data[known] = (prob * 100).astype(np.int8)
+        msg.data = data.flatten().tolist()
+        return msg
 
-        msg.data = grid_int.flatten().tolist()
-        self.map_pub.publish(msg)
+    # ── Imagen OpenCV para visualización ────────────────────────────────────
+    def to_image(self) -> np.ndarray:
+        """Mapa en escala de grises: blanco=libre, negro=ocupado, gris=desconocido."""
+        img = np.full((self.cells_y, self.cells_x), 128, dtype=np.uint8)
+        known = self.logodds != 0
+        prob = 1.0 / (1.0 + np.exp(-self.logodds[known].astype(np.float32) / 10.0))
+        img[known] = ((1.0 - prob) * 255).astype(np.uint8)
+        return cv2.flip(img, 0)   # flip Y para visualización estándar
 
-    # ---------------------------------------------------------------------- #
-    # Log de estado
-    # ---------------------------------------------------------------------- #
 
-    def _status_log(self):
-        self.get_logger().info(
-            f'odom msgs={self._odom_count}  scan msgs={self._scan_count}  '
-            f'robot=({self.robot_x:.2f}, {self.robot_y:.2f})  '
-            f'odom_ok={self.odom_ok}'
-        )
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FILTRO DE PARTÍCULAS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    # ---------------------------------------------------------------------- #
-    # Helpers
-    # ---------------------------------------------------------------------- #
+class ParticleFilter:
+    """
+    Filtro de partículas para SLAM 2D.
 
-    def _world_to_cell(self, x: float, y: float):
-        col = int((x - self.origin_x) / self.resolution)
-        row = int((y - self.origin_y) / self.resolution)
-        return col, row
+    Cada partícula es [x, y, theta] con su peso w.
 
-    def _in_bounds(self, col: int, row: int) -> bool:
-        return 0 <= col < self.cols and 0 <= row < self.rows
-    
-    def publish_tf(self):
-        t = TransformStamped()
-        t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = 'map'
-        t.child_frame_id = 'odom'
+    Pasos por iteración:
+      predict()  → motion model con ruido gaussiano
+      weight()   → sensor model: ray casting sobre el mapa
+      resample() → remuestreo sistemático
+    """
 
-        # Corrección: map_pose - odom_pose
-        t.transform.translation.x = self.robot_x - self.last_odom_x
-        t.transform.translation.y = self.robot_y - self.last_odom_y
-        t.transform.translation.z = 0.0
+    def __init__(self, n: int):
+        self.n = n
+        # Inicializar partículas cerca del origen (donde arranca el robot)
+        self.particles = np.zeros((n, 3))   # [x, y, theta]
 
-        yaw_correction = self.robot_yaw - self.last_odom_yaw
-        t.transform.rotation.z = math.sin(yaw_correction / 2.0)
-        t.transform.rotation.w = math.cos(yaw_correction / 2.0)
+        self.particles[:, 0] = np.random.uniform((MAP_SIZE_X/2)-0.3, (MAP_SIZE_X/2)+0.3, n)
+        self.particles[:, 1] = np.random.uniform((MAP_SIZE_Y/2)-0.3, (MAP_SIZE_Y/2)+0.3, n)
+        self.particles[:, 2] = np.random.normal(0.0, 0.0, n)
+        self.weights = np.ones(n) / n
 
-        self.tf_broadcaster.sendTransform(t)
-    
-    def publish_static_laser_tf(self):
-        t = TransformStamped()
+    # ── 1. Motion model ─────────────────────────────────────────────────────
+    def predict(self, dv: float, dw: float, dt: float):
+        """
+        Propaga cada partícula con el modelo cinemático diferencial
+        más ruido gaussiano.
 
-        t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = 'base_link'
-        t.child_frame_id = 'laser'
+          x'     = x + (v + noise_v) * cos(theta) * dt
+          y'     = y + (v + noise_v) * sin(theta) * dt
+          theta' = theta + (w + noise_w) * dt
+        """
+        n   = self.n
+        nv  = np.random.normal(0.0, SIGMA_XY,    n)
+        nw  = np.random.normal(0.0, SIGMA_THETA, n)
+        nxy = np.random.normal(0.0, SIGMA_XY / 3.0, (n, 2))
 
-        t.transform.translation.x = 0.0
-        t.transform.translation.y = 0.0
-        t.transform.translation.z = 0.10
+        v = dv + nv
+        w = dw + nw
 
-        t.transform.rotation.x = 0.0
-        t.transform.rotation.y = 0.0
-        t.transform.rotation.z = 1.0
-        t.transform.rotation.w = 0.0
+        self.particles[:, 0] += v * np.cos(self.particles[:, 2]) * dt + nxy[:, 0]
+        self.particles[:, 1] += v * np.sin(self.particles[:, 2]) * dt + nxy[:, 1]
+        self.particles[:, 2]  = np.array([wrap(a) for a in
+                                          self.particles[:, 2] + w * dt])
 
-        self.static_tf_broadcaster.sendTransform(t)
+    # ── 2. Sensor model ─────────────────────────────────────────────────────
+    def weight(self, occ_map: OccupancyMap,
+               scan_ranges: np.ndarray, scan_angles: np.ndarray):
+        """
+        Puntúa cada partícula comparando el scan LIDAR contra el mapa.
 
-    def compute_particle_weight(self, particle, scan_msg):
+        Para cada rayo válido calcula el punto de impacto esperado y consulta
+        la probabilidad de ocupación en el mapa.  La puntuación total de la
+        partícula es el producto de los scores individuales de cada rayo
+        (en log para evitar underflow).
 
-        known_cells = np.count_nonzero(self.logodds)
-        if known_cells < 50:
-            return 1.0
+        Score de un rayo:
+          - Si la celda de impacto está ocupada (prob > umbral): P_HIT * gauss(0, SIGMA_HIT)
+          - Si no:  P_RAND  (ruido uniforme)
+        """
+        log_weights = np.zeros(self.n)
 
-        score = 0.0
-        angle = scan_msg.angle_min
+        valid_idx = np.where(
+            (scan_ranges > LIDAR_MIN_M) & (scan_ranges < LIDAR_MAX_M)
+        )[0]
 
-        # Pre-calcular mapa de distancias (solo cuando el mapa cambia significativamente)
-        # Por ahora: buscar celda ocupada más cercana en ventana pequeña
-        SIGMA = 0.15   # metros — tolerancia de matching
-        sigma_cells = max(1, int(SIGMA / self.resolution))
-
-        for i in range(0, len(scan_msg.ranges), 4):
-
-            dist = scan_msg.ranges[i]
-
-            if math.isnan(dist) or math.isinf(dist):
-                angle += scan_msg.angle_increment * 4
-                continue
-            if dist < self.range_min_threshold:
-                angle += scan_msg.angle_increment * 4
-                continue
-
-            dist = min(dist, 2.5)
-
-            world_angle = particle.theta + angle
-            hit_x = particle.x + dist * math.cos(world_angle)
-            hit_y = particle.y + dist * math.sin(world_angle)
-
-            col, row = self._world_to_cell(hit_x, hit_y)
-
-            # ── Likelihood field: buscar celda ocupada más cercana ──────────
-            if self._in_bounds(col, row):
-
-                # ventana de búsqueda alrededor del hit
-                best_dist_sq = float('inf')
-
-                r0 = max(0,            row - sigma_cells)
-                r1 = min(self.rows-1,  row + sigma_cells)
-                c0 = max(0,            col - sigma_cells)
-                c1 = min(self.cols-1,  col + sigma_cells)
-
-                window = self.logodds[r0:r1+1, c0:c1+1]
-                occ_positions = np.argwhere(window > 0.3)
-
-                if len(occ_positions) > 0:
-                    # distancia en celdas al ocupado más cercano
-                    dr = occ_positions[:, 0] - (row - r0)
-                    dc = occ_positions[:, 1] - (col - c0)
-                    dist_sq = dr**2 + dc**2
-                    best_dist_sq = float(dist_sq.min())
-
-                    # gaussiana sobre distancia métrica
-                    dist_m = math.sqrt(best_dist_sq) * self.resolution
-                    score += math.exp(-(dist_m**2) / (2 * SIGMA**2))
-                else:
-                    score -= 0.1   # penalización suave si no hay ocupado cercano
-
-            angle += scan_msg.angle_increment * 4
-
-        return max(score, 0.0001)
-        
-    def normalize_weights(self):
-        total = sum(p.weight for p in self.particles)
-
-        if total <= 0.0:
+        if len(valid_idx) == 0:
             return
 
-        for p in self.particles:
-            p.weight /= total
+        for pi in range(self.n):
+            px, py, pth = self.particles[pi]
+            log_w = 0.0
 
-    def resample_particles(self):
+            for i in valid_idx:
+                r     = scan_ranges[i]
+                angle = pth + scan_angles[i]
+                hx    = px + r * math.cos(angle)
+                hy    = py + r * math.sin(angle)
 
-        weights = [p.weight for p in self.particles]
-        n_eff = 1.0 / sum(w**2 for w in weights)
+                occ = occ_map.get_occ(hx, hy)
 
-        if n_eff > self.num_particles * 0.5:
-            return  # partículas todavía diversas, no resamplear
-        
-        indices = np.random.choice(
-            len(self.particles),
-            size=len(self.particles),
-            p=weights
-        )
+                if occ > 0.5:
+                    # Celda ocupada: score proporcional a gaussiana centrada en 0
+                    score = P_HIT * math.exp(-0.5 * (0.0 / SIGMA_HIT) ** 2)
+                else:
+                    # Celda libre o desconocida: sólo ruido de fondo
+                    score = P_RAND
 
-        new_particles = []
+                score = max(score, 1e-300)
+                log_w += math.log(score)
 
-        for idx in indices:
+            log_weights[pi] = log_w
 
-            p = self.particles[idx]
+        # Normalizar en escala log para estabilidad numérica
+        log_weights -= log_weights.max()
+        self.weights = np.exp(log_weights)
+        total = self.weights.sum()
+        if total > 0:
+            self.weights /= total
+        else:
+            self.weights = np.ones(self.n) / self.n
 
-            new_particles.append(
-                Particle(
-                    p.x + random.gauss(0.0, 0.002),
-                    p.y + random.gauss(0.0, 0.002),
-                    p.theta + random.gauss(0.0, 0.01)
-                )
-            )
+    # ── 3. Resampling (sistemático) ─────────────────────────────────────────
+    def resample(self):
+        """
+        Remuestreo sistemático: O(N), sin sesgo, estándar en MCL.
 
-        self.particles = new_particles
+        Genera N nuevas partículas sorteadas con probabilidad proporcional
+        a su peso.  Las partículas con peso bajo tienden a desaparecer;
+        las de peso alto se replican.
+        """
+        positions = (np.arange(self.n) + np.random.uniform()) / self.n
+        cumsum    = np.cumsum(self.weights)
+        i, j      = 0, 0
+        indices   = np.zeros(self.n, dtype=int)
+        while i < self.n:
+            if positions[i] < cumsum[j]:
+                indices[i] = j
+                i += 1
+            else:
+                j = min(j + 1, self.n - 1)
+        self.particles = self.particles[indices]
+        self.weights   = np.ones(self.n) / self.n
+
+    # ── Estimación de pose (media ponderada) ─────────────────────────────────
+    def estimate(self):
+        """Devuelve (x, y, theta) como media ponderada de las partículas."""
+        x     = float(np.average(self.particles[:, 0], weights=self.weights))
+        y     = float(np.average(self.particles[:, 1], weights=self.weights))
+        sin_t = float(np.average(np.sin(self.particles[:, 2]), weights=self.weights))
+        cos_t = float(np.average(np.cos(self.particles[:, 2]), weights=self.weights))
+        theta = math.atan2(sin_t, cos_t)
+        return x, y, theta
+
+    # ── Partícula de mayor peso ───────────────────────────────────────────────
+    def best(self):
+        """Devuelve la partícula con mayor peso (para actualizar el mapa)."""
+        idx = int(np.argmax(self.weights))
+        return self.particles[idx]
 
 
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════════
+#  NODO ROS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SlamNode(Node):
+    def __init__(self):
+        super().__init__('slam_node')
+
+        # ── Mapa y filtro ──────────────────────────────────────────────────
+        self.occ_map = OccupancyMap(MAP_SIZE_X, MAP_SIZE_Y, MAP_RES)
+        self.pf      = ParticleFilter(N_PARTICLES)
+
+        # ── Estado de odometría ────────────────────────────────────────────
+        self.last_odom_x     = 0.0
+        self.last_odom_y     = 0.0
+        self.last_odom_theta = 0.0
+        self.odom_ready      = False
+
+        self.last_v = 0.0   # velocidad lineal del último /odom
+        self.last_w = 0.0   # velocidad angular del último /odom
+        self.last_odom_time = None
+
+        # ── Scan LIDAR más reciente ────────────────────────────────────────
+        self.latest_scan = None
+
+        # ── Publishers ────────────────────────────────────────────────────
+        self.pose_pub      = self.create_publisher(
+            PoseWithCovarianceStamped, '/slam/pose', 10)
+        self.map_pub       = self.create_publisher(
+            OccupancyGrid, '/slam/map', 10)
+        self.particles_pub = self.create_publisher(
+            PoseArray, '/slam/particles', 10)
+
+        self.tf_br = TransformBroadcaster(self)
+
+        # ── Subscribers ───────────────────────────────────────────────────
+        qos_sensor = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST, depth=5)
+
+        self.create_subscription(Odometry,   '/odom', self.odom_cb,  qos_sensor)
+        self.create_subscription(LaserScan,  '/scan', self.scan_cb,  qos_sensor)
+
+        # ── Timer principal: corre el pipeline SLAM a ~5 Hz ───────────────
+        self.slam_timer = self.create_timer(0.2, self.slam_step)
+
+        # ── Timer de publicación del mapa: cada 2 s ────────────────────────
+        self.map_timer  = self.create_timer(2.0, self.publish_map)
+
+        self.get_logger().info(
+            f'slam_node listo | {N_PARTICLES} partículas | '
+            f'mapa {MAP_SIZE_X}x{MAP_SIZE_Y} m @ {MAP_RES} m/celda')
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  CALLBACKS DE SENSORES
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def odom_cb(self, msg: Odometry):
+        """Guarda velocidades y computa delta de pose desde el último mensaje."""
+        self.last_v = msg.twist.twist.linear.x
+        self.last_w = msg.twist.twist.angular.z
+
+        x     = msg.pose.pose.position.x
+        y     = msg.pose.pose.position.y
+        theta = quat_to_yaw(msg.pose.pose.orientation.z,
+                            msg.pose.pose.orientation.w)
+
+        if not self.odom_ready:
+            self.last_odom_x     = x
+            self.last_odom_y     = y
+            self.last_odom_theta = theta
+            self.odom_ready      = True
+
+        self.last_odom_x     = x
+        self.last_odom_y     = y
+        self.last_odom_theta = theta
+        self.last_odom_time  = self.get_clock().now()
+
+    def scan_cb(self, msg: LaserScan):
+        """Guarda el scan más reciente, submuestreado a N_RAYS rayos."""
+        ranges = np.array(msg.ranges, dtype=np.float32)
+        angles = np.array([msg.angle_min + i * msg.angle_increment
+                           for i in range(len(ranges))], dtype=np.float32)
+
+        # Submuestreo uniforme a N_RAYS
+        idx = np.linspace(0, len(ranges) - 1, N_RAYS, dtype=int)
+        self.latest_scan = (ranges[idx], angles[idx])
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  PIPELINE SLAM  (se ejecuta a ~5 Hz)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def slam_step(self):
+        if not self.odom_ready or self.latest_scan is None:
+            return
+
+        scan_ranges, scan_angles = self.latest_scan
+        dt = 0.2   # período del timer
+
+        # ── 1. PREDICCIÓN: motion model con velocidades actuales ───────────
+        self.pf.predict(self.last_v, self.last_w, dt)
+
+        # ── 2. PONDERACIÓN: sensor model ──────────────────────────────────
+        # Solo puntuar si el mapa ya tiene algo de información
+        if np.any(self.occ_map.logodds != 0):
+            self.pf.weight(self.occ_map, scan_ranges, scan_angles)
+
+        # ── 3. REMUESTREO ─────────────────────────────────────────────────
+        # Número efectivo de partículas: N_eff = 1/sum(w²)
+        n_eff = 1.0 / (np.sum(self.pf.weights ** 2) + 1e-10)
+        if n_eff < self.pf.n / 2:
+            self.pf.resample()
+
+        # ── 4. ESTIMACIÓN de pose ─────────────────────────────────────────
+        est_x, est_y, est_theta = self.pf.estimate()
+
+        # ── 5. ACTUALIZAR MAPA con la mejor partícula ─────────────────────
+        best = self.pf.best()
+        self.occ_map.update(best[0], best[1], best[2],
+                            scan_ranges, scan_angles)
+
+        # ── 6. PUBLICAR pose, partículas y TF ─────────────────────────────
+        stamp = self.get_clock().now().to_msg()
+        self._publish_pose(est_x, est_y, est_theta, stamp)
+        self._publish_particles(stamp)
+        self._publish_tf(est_x, est_y, est_theta, stamp)
+
+        # ── 7. Visualización OpenCV (opcional) ───────────────────────────
+        if SHOW_MAP:
+            self._show_map(est_x, est_y, est_theta)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  PUBLICADORES
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _publish_pose(self, x, y, theta, stamp):
+        msg = PoseWithCovarianceStamped()
+        msg.header.stamp    = stamp
+        msg.header.frame_id = 'map'
+        msg.pose.pose.position.x = x
+        msg.pose.pose.position.y = y
+        qx, qy, qz, qw = yaw_to_quat(theta)
+        msg.pose.pose.orientation.x = qx
+        msg.pose.pose.orientation.y = qy
+        msg.pose.pose.orientation.z = qz
+        msg.pose.pose.orientation.w = qw
+        # Covarianza diagonal simplificada
+        msg.pose.covariance[0]  = 0.1
+        msg.pose.covariance[7]  = 0.1
+        msg.pose.covariance[35] = 0.2
+        self.pose_pub.publish(msg)
+
+    def _publish_particles(self, stamp):
+        msg = PoseArray()
+        msg.header.stamp    = stamp
+        msg.header.frame_id = 'map'
+        for p in self.pf.particles:
+            pose = Pose()
+            pose.position.x = float(p[0])
+            pose.position.y = float(p[1])
+            qx, qy, qz, qw = yaw_to_quat(float(p[2]))
+            pose.orientation.x = qx
+            pose.orientation.y = qy
+            pose.orientation.z = qz
+            pose.orientation.w = qw
+            msg.poses.append(pose)
+        self.particles_pub.publish(msg)
+
+    def _publish_tf(self, x, y, theta, stamp):
+        """Publica TF map → odom.  El TF odom → base_link lo publica la Jetson."""
+        qx, qy, qz, qw = yaw_to_quat(theta)
+        tf = TransformStamped()
+        tf.header.stamp    = stamp
+        tf.header.frame_id = 'map'
+        tf.child_frame_id  = 'odom'
+        # La corrección SLAM es la diferencia entre la pose estimada y la odometría
+        # Para simplificar: publicamos map→odom como la pose estimada MCL
+        tf.transform.translation.x = x
+        tf.transform.translation.y = y
+        tf.transform.translation.z = 0.0
+        tf.transform.rotation.x = qx
+        tf.transform.rotation.y = qy
+        tf.transform.rotation.z = qz
+        tf.transform.rotation.w = qw
+        self.tf_br.sendTransform(tf)
+
+    def publish_map(self):
+        """Publica el mapa de ocupación en ROS (para rviz / nav2)."""
+        stamp = self.get_clock().now().to_msg()
+        msg   = self.occ_map.to_ros_msg(stamp, 'map')
+        self.map_pub.publish(msg)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  VISUALIZACIÓN OpenCV
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _show_map(self, robot_x: float, robot_y: float, robot_theta: float):
+        img = self.occ_map.to_image()
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+        cells_x = self.occ_map.cells_x
+        cells_y = self.occ_map.cells_y
+        res     = self.occ_map.res
+        orig_x  = self.occ_map.origin_x
+        orig_y  = self.occ_map.origin_y
+
+        def w2p(wx, wy):
+            cx = int((wx - orig_x) / res)
+            cy = cells_y - int((wy - orig_y) / res)
+            return cx, cy
+
+        # Partículas
+        for p in self.pf.particles:
+            px, py = w2p(p[0], p[1])
+            if 0 <= px < cells_x and 0 <= py < cells_y:
+                cv2.circle(img, (px, py), 1, (0, 200, 255), -1)
+
+        # Robot
+        rx, ry = w2p(robot_x, robot_y)
+        cv2.circle(img, (rx, ry), 5, (255, 80, 0), -1)
+        ax = int(rx + 15 * math.cos(robot_theta))
+        ay = int(ry - 15 * math.sin(robot_theta))
+        cv2.arrowedLine(img, (rx, ry), (ax, ay), (255, 255, 255), 2, tipLength=0.4)
+
+        # Info de pose
+        cv2.putText(img,
+            f'x={robot_x:.2f}m  y={robot_y:.2f}m  th={math.degrees(robot_theta):.1f}deg',
+            (10, cells_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+
+        # Escalar imagen para que sea visible
+        scale = max(1, 600 // max(cells_x, cells_y))
+        if scale > 1:
+            img = cv2.resize(img, (cells_x * scale, cells_y * scale),
+                            interpolation=cv2.INTER_NEAREST)
+
+        cv2.imshow('SLAM Map', img)
+        cv2.waitKey(1)
+
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def main(args=None):
     rclpy.init(args=args)
-    node = OccupancyGridNode()
+    node = SlamNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
+        if SHOW_MAP:
+            cv2.destroyAllWindows()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
