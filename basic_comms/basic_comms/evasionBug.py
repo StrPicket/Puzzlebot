@@ -283,7 +283,7 @@ class WaypointsBugNode(Node):
         # ── Sub-caso 1: esquina — giro in-situ ────────────────────────────
         if self.front_dist < DANGER_DIST * 0.7:
             cmd.linear.x  = 0.0
-            cmd.angular.z = -self.wall_side * 0.35   # gira hacia el lado libre
+            cmd.angular.z = -self.wall_side * 0.15   # gira hacia el lado libre
             return cmd
 
         # ── Sub-caso 2: frente cercano — frenar y girar suave ─────────────
@@ -309,13 +309,8 @@ class WaypointsBugNode(Node):
         else:
             if self._on_mline(goal_x, goal_y) and self.hit_x is not None:
                 d_hit = math.hypot(self.x - self.hit_x, self.y - self.hit_y)
-                # El lateral de la MISMA pared debe estar despejado para
-                # confirmar que el obstáculo terminó realmente
-                lateral_same = (self.left_dist if self.wall_side == 1
-                                else self.right_dist)
                 if (dist_to_goal < self.hit_dist_to_goal - 0.05
                         and self.front_dist > DANGER_DIST
-                        and lateral_same > DANGER_DIST
                         and d_hit > 0.10):
                     self._exit_wall_follow()
 
