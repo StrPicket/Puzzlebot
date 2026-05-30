@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'minichallenge1'
+package_name = 'puzzlebot_mapping'
 
 setup(
     name=package_name,
@@ -24,8 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'signal_generator = minichallenge1.signal_generator:main',
-            'proc_signal = minichallenge1.process:main',
-        ],
+            'mapeo  = puzzlebot_mapping.mapeo:main',
+            'mapeoSim     = puzzlebot_mapping.mapeoSim:main',
+        ],  
     },
 )
