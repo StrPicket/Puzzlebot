@@ -4,6 +4,8 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
 from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import Header
 from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 from std_msgs.msg import Float32
 
@@ -19,18 +21,18 @@ import math
 
 # ── Calibración de la cámara ───────────────────────────────────────────────
 CAMERA_MATRIX = np.array([
-    [133.87191654,   0.0,         157.76772928],
-    [  0.0,         131.02895435,  93.02396443],
+    [771.25742667,   0.0,         684.88203376],
+    [  0.0,         773.15472704,  361.72143901],
     [  0.0,           0.0,           1.0      ]
 ], dtype=np.float64)
 
 DIST_COEFFS = np.array(
-    [[-0.15698471, -0.61753973, -0.01000248, -0.00749885, 0.7441658]],
+    [[-4.12196743e-01,  2.39129843e-01,  9.29550695e-03,  6.35843547e-05,  -7.68077937e-02]],
     dtype=np.float64
 )
 
 # ── ArUco ─────────────────────────────────────────────────────────────────
-MARKER_SIZE = 0.095   # metros
+MARKER_SIZE = 0.055   # metros
 
 # Mapa de ArUcos: {id: (x_global_m, y_global_m, yaw_rad)}
 ARUCO_MAP = {
@@ -72,7 +74,7 @@ _WX_RANGE = max(_WX_MAX - _WX_MIN, 1.0)
 _WY_RANGE = max(_WY_MAX - _WY_MIN, 1.0)
 
 # ── Detector ArUco ─────────────────────────────────────────────────────────
-aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_APRILTAG_36H11)
+aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
 try:
     det_params = aruco.DetectorParameters()
 except AttributeError:
@@ -315,7 +317,7 @@ class ArucoPoseNode(Node):
         super().__init__('aruco_pose')
 
         # ── Publishers ────────────────────────────────────────────────────
-        self.image_pub   = self.create_publisher(Image, '/aruco/image_detected', 10)
+        self.image_pub   = self.create_publisher(CompressedImage, '/aruco/image_detected/compressed', 10)
         self.pose_pub    = self.create_publisher(PoseWithCovarianceStamped, '/aruco/pose', 10)
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
 
@@ -325,7 +327,7 @@ class ArucoPoseNode(Node):
             history=QoSHistoryPolicy.KEEP_LAST, depth=10)
 
         self.image_sub = self.create_subscription(
-            Image, '/image_raw', self.image_callback, qos_img)
+            CompressedImage, '/video_source/compressed', self.image_callback, 10)
 
         self.sub_encR = self.create_subscription(
             Float32, 'VelocityEncR', self.encR_callback, qos.qos_profile_sensor_data)
@@ -333,8 +335,8 @@ class ArucoPoseNode(Node):
             Float32, 'VelocityEncL', self.encL_callback, qos.qos_profile_sensor_data)
 
         # ── Cámara / ArUco ────────────────────────────────────────────────
-        self.camera_width  = 320
-        self.camera_height = 180
+        self.camera_width  = 1280
+        self.camera_height = 720
         self.bridge        = CvBridge()
         self.detector      = aruco.ArucoDetector(aruco_dict, det_params)
         self.latest_frame  = None
@@ -396,10 +398,10 @@ class ArucoPoseNode(Node):
     # ─────────────────────────────────────────────────────────────────────
     #  CALLBACK IMAGEN
     # ─────────────────────────────────────────────────────────────────────
-    def image_callback(self, msg: Image):
+    def image_callback(self, msg: CompressedImage):
         try:
-            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-            frame = cv2.resize(frame, (self.camera_width, self.camera_height))
+            np_arr = np.frombuffer(msg.data, np.uint8)
+            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             self.latest_frame  = frame
             self.latest_header = msg.header
         except Exception as e:
@@ -589,10 +591,11 @@ class ArucoPoseNode(Node):
 
         # ── Publicar imagen ───────────────────────────────────────────────
         try:
-            out_msg = self.bridge.cv2_to_imgmsg(frame, encoding='bgr8')
-            if self.latest_header is not None:
-                out_msg.header = self.latest_header
-            self.image_pub.publish(out_msg)
+            msg = CompressedImage()
+            msg.header = self.latest_header if self.latest_header is not None else Header()
+            msg.format = 'jpeg'
+            msg.data = np.array(cv2.imencode('.jpg', frame)[1]).tobytes()
+            self.image_pub.publish(msg)
         except Exception as e:
             self.get_logger().error(f'Error publicando imagen: {e}')
 
