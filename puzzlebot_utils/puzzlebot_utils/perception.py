@@ -2,7 +2,8 @@
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+import numpy as np
+from sensor_msgs.msg import Image, CompressedImage
 from cv_bridge import CvBridge
 import cv2
 import os
@@ -14,10 +15,10 @@ class PuzzlebotAutoCapture(Node):
     def __init__(self):
         super().__init__('puzzlebot_auto_capture')
 
-        self.total_photos = 200
-        self.interval = 1.5
-        self.save_dir = "Dataset_TradeMarks"
-        self.image_topic = "/image_raw"
+        self.total_photos = 400
+        self.interval = 1.0
+        self.save_dir = "Dataset_TradeMarks_F"
+        self.image_topic = "/video_source/compressed"
 
         self.bridge = CvBridge()
         self.latest_frame = None
@@ -34,7 +35,7 @@ class PuzzlebotAutoCapture(Node):
         os.makedirs(self.save_dir, exist_ok=True)
 
         self.subscription = self.create_subscription(
-            Image,
+            CompressedImage,
             self.image_topic,
             self.image_callback,
             10
@@ -52,8 +53,15 @@ class PuzzlebotAutoCapture(Node):
 
     def image_callback(self, msg):
         try:
-            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-            frame = cv2.flip(frame, -1)# -1 = flip horizontal y vertical (180°)
+            np_arr = np.frombuffer(msg.data, np.uint8)
+            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+            if frame is None:
+                self.get_logger().error("No se pudo decodificar imagen comprimida")
+                return
+
+            frame = cv2.flip(frame, 1)
+
             self.fps_frame_count += 1
             now = time.time()
             if now - self.fps_last_time >= 1.0:
