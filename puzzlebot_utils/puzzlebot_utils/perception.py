@@ -17,7 +17,7 @@ class PuzzlebotAutoCapture(Node):
 
         self.total_photos = 400
         self.interval = 1.0
-        self.save_dir = "Dataset_TradeMarks_F"
+        self.save_dir = "Dataset_TradeMarks_C"
         self.image_topic = "/video_source/compressed"
 
         self.bridge = CvBridge()
@@ -60,7 +60,7 @@ class PuzzlebotAutoCapture(Node):
                 self.get_logger().error("No se pudo decodificar imagen comprimida")
                 return
 
-            frame = cv2.flip(frame, 1)
+            #frame = cv2.flip(frame, 1)
 
             self.fps_frame_count += 1
             now = time.time()
