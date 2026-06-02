@@ -7,9 +7,10 @@ from std_msgs.msg import Header
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from visualization_msgs.msg import MarkerArray, Marker
 from std_msgs.msg import ColorRGBA
-from rclpy.qos import QoSProfile, QoSDurabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, QoSDurabilityPolicy
 import threading
 import queue
+from collections import deque
 import time
 
 import cv2
@@ -21,23 +22,21 @@ import math
 #  CONFIGURACIÓN GLOBAL
 # ═══════════════════════════════════════════════════════════════════════════
 
-# ── Calibración de la cámara ───────────────────────────────────────────────
 CAMERA_MATRIX = np.array([
-    [771.25742667,   0.0,         684.88203376],
-    [  0.0,         773.15472704,  361.72143901],
+    [1.32035342e+03, 0.0           , 6.31747899e+02],
+    [0.00000000e+00, 1.32353022e+03, 2.96231877e+02],
     [  0.0,           0.0,           1.0      ]
 ], dtype=np.float64)
 
 DIST_COEFFS = np.array(
-    [[-4.12196743e-01,  2.39129843e-01,  9.29550695e-03,  6.35843547e-05,  -7.68077937e-02]],
+    [[4.01198628e-01, -1.93104010e+00, -1.77289440e-02, -3.22599073e-04, 4.79884803e+00]],
     dtype=np.float64
 )
 
-# ── ArUco ─────────────────────────────────────────────────────────────────
-MARKER_SIZE = 0.098   # metros
-
+MARKER_SIZE    = 0.095
 X_ARUCO_OFFSET = 0.608
-# Mapa de ArUcos: {id: (x_global_m, y_global_m, yaw_rad)}
+P_MAX_XY       = 0.5    # m²
+P_MAX_THETA    = 0.3    # rad²
 
 ARUCO_MAP = {
     0:  (3.757 + X_ARUCO_OFFSET, 3.711, -math.pi/2),
@@ -53,13 +52,11 @@ ARUCO_MAP = {
     10: (1.505 + X_ARUCO_OFFSET, 1.365, -math.pi/2),
 }
 
-# ── Filtro de Kalman ───────────────────────────────────────────────────────
-KF_Q_XY    = 0.001   # m²/paso   — confianza en la odometría
-KF_Q_THETA = 0.001   # rad²/paso
-KF_R_XY    = 0.1    # m²        — confianza en ArUco
-KF_R_THETA = 0.1    # rad²
+KF_Q_XY    = 0.001
+KF_Q_THETA = 0.001
+KF_R_XY    = 0.1
+KF_R_THETA = 0.1
 
-# ── Detector ArUco ─────────────────────────────────────────────────────────
 aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
 try:
     det_params = aruco.DetectorParameters()
@@ -80,28 +77,31 @@ class PoseKalmanFilter:
         self.initialized = False
 
     def predict_with_odometry(self, dx: float, dy: float, dtheta: float):
-        # Ruido de proceso proporcional al desplazamiento
-        dist = math.sqrt(dx ** 2 + dy ** 2)
-        Q_dyn = self.Q + np.diag([
-            dist * 0.0001,          # error lateral proporcional al avance
-            dist * 0.0001,
-            abs(dtheta) * 0.0005    # error angular proporcional al giro
-        ])
+        dist = math.sqrt(dx**2 + dy**2)
 
         if not self.initialized:
             self.initialized = True
-            # Estado inicial: origen
             self.x = np.array([dx, dy, dtheta])
             return
 
-        # Propagar estado con el movimiento
         self.x[0] += dx
         self.x[1] += dy
         self.x[2]  = wrap_angle(self.x[2] + dtheta)
-        self.P     = self.P + Q_dyn
+
+        # Ruido proporcional al movimiento — no crece cuando el robot está quieto
+        Q_dyn = np.diag([
+            dist * 0.05 + abs(dtheta) * 0.005 + 1e-5,
+            dist * 0.05 + abs(dtheta) * 0.005 + 1e-5,
+            abs(dtheta) * 0.05 + dist * 0.005 + 1e-5,
+        ])
+        self.P = self.P + Q_dyn
+
+        # Clamp: evita explosión sin corrección ArUco
+        self.P[0, 0] = min(self.P[0, 0], P_MAX_XY)
+        self.P[1, 1] = min(self.P[1, 1], P_MAX_XY)
+        self.P[2, 2] = min(self.P[2, 2], P_MAX_THETA)
 
     def update(self, z: np.ndarray):
-        """Corrección con medición ArUco z = [x_m, y_m, θ_m]."""
         if not self.initialized:
             self.x = z.copy()
             self.initialized = True
@@ -113,9 +113,9 @@ class PoseKalmanFilter:
         innov    = z - self.x
         innov[2] = wrap_angle(innov[2])
 
-        self.x      = self.x + K @ innov
-        self.x[2]   = wrap_angle(self.x[2])
-        self.P      = (np.eye(3) - K) @ self.P
+        self.x    = self.x + K @ innov
+        self.x[2] = wrap_angle(self.x[2])
+        self.P    = (np.eye(3) - K) @ self.P
 
     @property
     def state(self):
@@ -139,46 +139,77 @@ def marker_side_px(corners_px: np.ndarray) -> float:
     return float(np.mean(sides))
 
 def dist_from_pixels(side_px: float) -> float:
-    fx = CAMERA_MATRIX[0, 0]
-    fy = CAMERA_MATRIX[1, 1]
+    fx     = CAMERA_MATRIX[0, 0]
+    fy     = CAMERA_MATRIX[1, 1]
     f_mean = (fx + fy) / 2.0
     if side_px < 2.0:
         return -1.0
     return f_mean * MARKER_SIZE / side_px
 
-def estimate_robot_pose(tvec, rvec, marker_id, corners_px):
+def estimate_robot_pose(tvec, rvec, marker_id):
     if marker_id not in ARUCO_MAP:
         return None
 
     mx, my, m_yaw = ARUCO_MAP[marker_id]
 
+    # Pose cámara respecto al marcador
     R, _ = cv2.Rodrigues(rvec)
-    R_inv = R.T
-    t_inv = -R_inv @ tvec
 
-    cam_x   = -t_inv[0][0]
-    side_px = marker_side_px(corners_px)
-    dist_px = dist_from_pixels(side_px)
-    if dist_px < 0: 
+    # Posición de la cámara en el frame del marcador
+    cam_marker = -R.T @ tvec
+
+    cam_x_marker = float(cam_marker[0, 0])
+    cam_z_marker = float(cam_marker[2, 0])
+
+    dist_h = math.sqrt(cam_x_marker**2 + cam_z_marker**2)
+
+    # Ángulo de visión del marcador
+    marker_normal = R[:, 2]
+
+    cos_view = abs(marker_normal[2])
+    cos_view = np.clip(cos_view, -1.0, 1.0)
+
+    view_angle = math.degrees(math.acos(cos_view))
+
+    # Descartar marcadores demasiado oblicuos
+    if view_angle > 45.0:
         return None
 
-    cam_z   = math.sqrt(max(dist_px ** 2 - cam_x ** 2, 0.0))
-    dist_h  = math.sqrt(cam_x ** 2 + cam_z ** 2)
-    bearing = math.atan2(cam_x, cam_z)
+    # Yaw de la cámara respecto al marcador
+    yaw_cam = math.atan2(R[0, 2], R[2, 2])
 
-    yaw_cam     = math.atan2(R_inv[0, 2], R_inv[2, 2])
-    robot_theta = wrap_angle(m_yaw - yaw_cam)
+    # Orientación global robot
+    robot_theta = wrap_angle(m_yaw + math.pi - yaw_cam)
 
-    robot_x = mx + cam_z * math.cos(m_yaw) - cam_x * math.sin(m_yaw)
-    robot_y = my + cam_z * math.sin(m_yaw) + cam_x * math.cos(m_yaw)
+    # Transformación marcador -> mapa
+    robot_x = (
+        mx
+        + cam_z_marker * math.cos(m_yaw)
+        - cam_x_marker * math.sin(m_yaw)
+    )
 
-    # Corrección cámara → centro del robot
-    dx = 0.1
-    robot_x -= dx * math.cos(robot_theta)
-    robot_y -= dx * math.sin(robot_theta)
+    robot_y = (
+        my
+        + cam_z_marker * math.sin(m_yaw)
+        + cam_x_marker * math.cos(m_yaw)
+    )
 
-    return robot_x, robot_y, robot_theta, dist_h, bearing
+    # Offset cámara -> centro robot
+    CAMERA_TO_CENTER = 0.10
 
+    robot_x -= CAMERA_TO_CENTER * math.cos(robot_theta)
+    robot_y -= CAMERA_TO_CENTER * math.sin(robot_theta)
+
+    bearing = math.atan2(cam_x_marker, cam_z_marker)
+
+    return (
+        robot_x,
+        robot_y,
+        robot_theta,
+        dist_h,
+        bearing,
+        view_angle
+    )
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  NODO PRINCIPAL
@@ -189,47 +220,61 @@ class ArucoPoseNode(Node):
         super().__init__('aruco_pose')
 
         # ── Publishers ────────────────────────────────────────────────────
-        self.image_pub   = self.create_publisher(CompressedImage, '/aruco/image_detected/compressed', 10)
-        self.pose_centered_pub = self.create_publisher(PoseWithCovarianceStamped, '/aruco/pose_centered', 10)
+        self.image_pub         = self.create_publisher(
+            CompressedImage, '/aruco/image_detected/compressed', 10)
+        self.pose_centered_pub = self.create_publisher(
+            PoseWithCovarianceStamped, '/aruco/pose_centered', 10)
 
-        self._annotated_queue = queue.Queue(maxsize=2)  # máximo 2 frames pendientes
-
+        self._annotated_queue = queue.Queue(maxsize=2)
         self._pub_thread = threading.Thread(target=self._image_pub_loop, daemon=True)
         self._pub_thread.start()
 
-        latched_qos = QoSProfile(
-            depth=1,
-            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        latched_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self.aruco_markers_pub = self.create_publisher(MarkerArray, '/aruco/markers', latched_qos)
 
-        self.aruco_markers_pub = self.create_publisher(
-            MarkerArray, '/aruco/markers', latched_qos)
-        
-        self._kf_lock = threading.Lock()
+        # ── Locks y estado compartido ─────────────────────────────────────
+        self._kf_lock      = threading.Lock()
+        self._frame_lock   = threading.Lock()
+        self._vis_lock     = threading.Lock()   # protege visible_ids
 
-        self.last_odom_x     = None   # None indica que aún no recibimos el primer mensaje
+        # ── Odometría ────────────────────────────────────────────────────
+        self.last_odom_x     = None
         self.last_odom_y     = None
         self.last_odom_theta = None
+        self.odo_x = self.odo_y = self.odo_theta = 0.0
 
+        image_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+
+        # ── Subscriptions ────────────────────────────────────────────────
         self.odom_sub = self.create_subscription(
             Odometry, '/odom', self._odom_callback,
             qos.qos_profile_sensor_data)
-        
         self.mcl_sub = self.create_subscription(
             PoseWithCovarianceStamped, '/mcl/pose',
             self._mcl_pose_callback, 10)
-
         self.image_sub = self.create_subscription(
-            CompressedImage, '/video_source/compressed', self.image_callback, 10)
-
+            CompressedImage, '/video_source/compressed', self.image_callback, image_qos)
 
         # ── Cámara / ArUco ────────────────────────────────────────────────
-        self.camera_width  = 1280
-        self.camera_height = 720
-        self.detector      = aruco.ArucoDetector(aruco_dict, det_params)
-        self.latest_frame  = None
-        self.latest_header = None
-        self.ROI_MARGIN = 0.20 # margen para recortar bordes (20% de la imagen)
+        # ── Cámara / ArUco ────────────────────────────────────────────────
+        self.detector          = aruco.ArucoDetector(aruco_dict, det_params)
+        self.latest_frame      = None
+        self.latest_full_frame = None
+        self.latest_header     = None
         self.latest_frame_time = None
+        self.latest_raw_jpeg   = None
+        self._new_raw_evt      = threading.Event()
+        self.ROI_MARGIN        = 0.20
+        self.last_valid_id = None
+        self.same_id_count = 0
+
+        self.aruco_history = {}
+
+        self.MIN_CONSECUTIVE_ARUCO = 15
 
         half = MARKER_SIZE / 2.0
         self.obj_points = np.array([
@@ -239,17 +284,8 @@ class ArucoPoseNode(Node):
             [-half, -half, 0.0],
         ], dtype=np.float64)
 
-
-        # ── Odometría pura ─────────────────
-        self.odo_x     = 0.0
-        self.odo_y     = 0.0
-        self.odo_theta = 0.0
-
-        # ── Filtro de Kalman ──────────────────────────
-        self.kf = PoseKalmanFilter(
-            q_xy=KF_Q_XY, q_theta=KF_Q_THETA,
-            r_xy=KF_R_XY, r_theta=KF_R_THETA)
-
+        # ── Kalman ───────────────────────────────────────────────────────
+        self.kf       = PoseKalmanFilter(KF_Q_XY, KF_Q_THETA, KF_R_XY, KF_R_THETA)
         self.kf_x     = 0.0
         self.kf_y     = 0.0
         self.kf_theta = 0.0
@@ -257,28 +293,35 @@ class ArucoPoseNode(Node):
         self.MAP_OFFSET_X = 2.825
         self.MAP_OFFSET_Y = 1.925
 
-        # ── ArUcos visibles  ────────────────────────────────
-        self.visible_ids = []
+        # ── ArUcos visibles (acceso protegido por _vis_lock) ─────────────
+        self._visible_ids: list = []
 
+        # Publicar markers al inicio (latched — solo una vez)
         self._publish_aruco_markers()
 
-        # ── Timers ───────────────────────────────────────────────────────
-        self._frame_lock = threading.Lock()
-        self._latest_gray = None
+        # ── Hilo de detección y timer de publicación ──────────────────────
         self._processing_thread = threading.Thread(
             target=self._detection_loop, daemon=True)
         self._processing_thread.start()
 
-        self.timer_main = self.create_timer(1 / 30,  self._publish_only)
+        self._decode_thread = threading.Thread(
+            target=self._decode_loop, daemon=True)
+        self._decode_thread.start()
 
-    # ── 1. Throttle explícito al publicador de imagen ──────────────────────
+        self.timer_main = self.create_timer(1 / 30, self._publish_only)
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  PUBLICADOR DE IMAGEN (hilo dedicado)
+    # ─────────────────────────────────────────────────────────────────────
     def _image_pub_loop(self):
-        last_pub = 0.0
-        MIN_INTERVAL = 1 / 15.0
+        """Publica imagen anotada a máximo 15 Hz, drenando frames viejos."""
+        last_pub      = 0.0
+        MIN_INTERVAL  = 1.0 / 15.0
+        encode_params = [cv2.IMWRITE_JPEG_QUALITY, 65]
 
         while rclpy.ok():
             try:
-                # Drenar la cola — solo nos interesa el frame más reciente
+                # Drenar cola — solo nos interesa el más reciente
                 annotated, header = self._annotated_queue.get(timeout=0.5)
                 while not self._annotated_queue.empty():
                     try:
@@ -291,381 +334,505 @@ class ArucoPoseNode(Node):
                     continue
                 last_pub = now
 
-                out = CompressedImage()
+                # Publicar ya en 640×360 (decode_loop redujo el full_frame,
+                # annotated viene de full_frame.copy() con anotaciones)
+                pub = cv2.resize(annotated, (640, 360),
+                                interpolation=cv2.INTER_LINEAR)
+                ok, buf = cv2.imencode('.jpg', pub, encode_params)
+                if not ok:
+                    continue
+
+                out        = CompressedImage()
                 out.header = header if header is not None else Header()
                 out.format = 'jpeg'
-                ok, buf = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 65])
-                if ok:
-                    out.data = buf.tobytes()
-                    self.image_pub.publish(out)
+                out.data   = buf.tobytes()
+                self.image_pub.publish(out)
             except Exception:
                 pass
 
+    # ─────────────────────────────────────────────────────────────────────
+    #  CALLBACKS DE SUBSCRIPCIONES
+    # ─────────────────────────────────────────────────────────────────────
     def _odom_callback(self, msg: Odometry):
-        x     = msg.pose.pose.position.x
-        y     = msg.pose.pose.position.y
-        q     = msg.pose.pose.orientation
+        x = msg.pose.pose.position.x
+        y = msg.pose.pose.position.y
+        q = msg.pose.pose.orientation
         theta = math.atan2(
             2.0 * (q.w * q.z + q.x * q.y),
-            1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        )
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
-        # Primer mensaje: solo guardar referencia, no predecir
         if self.last_odom_x is None:
             self.last_odom_x     = x
             self.last_odom_y     = y
             self.last_odom_theta = theta
-            # Inicializar odometría visual con la pose inicial de /odom
-            self.odo_x     = x
-            self.odo_y     = y
-            self.odo_theta = theta
-            return
+            self.odo_x = x;  self.odo_y = y;  self.odo_theta = theta
+            return                          # ← ya no hay _odom_theta_offset
 
-        # Delta de pose entre mensajes consecutivos
-        dx     = x - self.last_odom_x
-        dy     = y - self.last_odom_y
-        dtheta = wrap_angle(theta - self.last_odom_theta)
+        dx_odom = x - self.last_odom_x
+        dy_odom = y - self.last_odom_y
+        dtheta  = wrap_angle(theta - self.last_odom_theta)
 
-        self.last_odom_x     = x
-        self.last_odom_y     = y
-        self.last_odom_theta = theta
+        self.last_odom_x = x;  self.last_odom_y = y;  self.last_odom_theta = theta
+        self.odo_x = x;        self.odo_y = y;         self.odo_theta = theta
 
-        # Actualizar odometría visual (para el mapa top-down)
-        self.odo_x     = x
-        self.odo_y     = y
-        self.odo_theta = theta
+        # ── Convertir delta odom → frame mapa ────────────────────────────────
+        theta_before     = wrap_angle(theta - dtheta)   # orientación odom ANTES del paso
+        dist             = math.hypot(dx_odom, dy_odom)
+        move_angle_odom  = math.atan2(dy_odom, dx_odom)
+        move_angle_local = wrap_angle(move_angle_odom - theta_before)  # relativo al robot
 
-        # Predicción Kalman con el delta odométrico
         with self._kf_lock:
-            self.kf.predict_with_odometry(dx, dy, dtheta)
+            map_theta_before = self.kf.x[2]             # orientación actual en mapa
+            global_angle     = map_theta_before + move_angle_local + math.pi
+            dx_map = dist * math.cos(global_angle)
+            dy_map = dist * math.sin(global_angle)
+
+            self.kf.predict_with_odometry(dx_map, dy_map, dtheta)
             self.kf_x, self.kf_y, self.kf_theta = self.kf.state
+        
 
     def _mcl_pose_callback(self, msg: PoseWithCovarianceStamped):
-        """
-        Corrección Kalman con pose MCL.
-        Solo se llama cuando ArUco no está visible (lo filtra mcl_localizer).
-        """
         if not self.kf.initialized:
             return
 
-        ox    = msg.pose.pose.position.x
-        oy    = msg.pose.pose.position.y
-        q     = msg.pose.pose.orientation
+        ox = msg.pose.pose.position.x
+        oy = msg.pose.pose.position.y
+        q  = msg.pose.pose.orientation
         theta = math.atan2(
             2.0 * (q.w * q.z + q.x * q.y),
-            1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        )
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
-        # Usar covarianza del mensaje MCL para ajustar la ganancia
-        # (MCL es menos preciso que ArUco, así que R es mayor)
+        r_xx = max(msg.pose.covariance[0],  1e-6)
+        r_yy = max(msg.pose.covariance[7],  1e-6)
+        r_tt = max(msg.pose.covariance[35], 1e-6)
 
         with self._kf_lock:
-            old_R = self.kf.R.copy()
-            self.kf.R = np.diag([
-                msg.pose.covariance[0],    # MCL_COV_XY
-                msg.pose.covariance[7],    # MCL_COV_XY
-                msg.pose.covariance[35]    # MCL_COV_THETA
-            ])
+            old_R    = self.kf.R.copy()
+            self.kf.R = np.diag([r_xx, r_yy, r_tt])
             self.kf.update(np.array([ox, oy, theta]))
             self.kf.R = old_R
             self.kf_x, self.kf_y, self.kf_theta = self.kf.state
-            
+
         self.get_logger().debug(
             f'[MCL→KF] x={self.kf_x:.2f} y={self.kf_y:.2f} '
             f'th={math.degrees(self.kf_theta):.1f}°')
 
-    # ─────────────────────────────────────────────────────────────────────
-    #  CALLBACK IMAGEN
-    # ─────────────────────────────────────────────────────────────────────
+    # ── image_callback — agrega el set() al final:
     def image_callback(self, msg: CompressedImage):
-        try:
-            np_arr = np.frombuffer(msg.data, np.uint8)
-            frame  = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        with self._frame_lock:
+            self.latest_frame      = None
+            self.latest_raw_jpeg   = bytes(msg.data)
+            self.latest_header     = msg.header
+            self.latest_frame_time = self.get_clock().now()
+        self._new_raw_evt.set()   # ← despierta _decode_loop sin polling
+
+    def _decode_loop(self):
+        """Decodifica JPEGs en hilo propio, despertado por evento."""
+        last_stamp_ns = -1
+
+        while rclpy.ok():
+            # Bloquear hasta que llegue frame nuevo — sin polling
+            self._new_raw_evt.wait(timeout=0.2)
+            self._new_raw_evt.clear()
+
             with self._frame_lock:
-                self.latest_frame  = frame
-                self.latest_header = msg.header
-                self.latest_frame_time = self.get_clock().now()  # ── NUEVO
-        except Exception as e:
-            self.get_logger().error(f'image_callback: {e}')
+                raw      = getattr(self, 'latest_raw_jpeg', None)
+                stamp    = self.latest_frame_time
+
+            if raw is None or stamp is None:
+                continue
+
+            stamp_ns = stamp.nanoseconds
+            if stamp_ns == last_stamp_ns:
+                continue
+
+            # Decodificar y hacer resize YA aquí — detection_loop recibe
+            # frame pequeño listo para usar, sin trabajo extra
+            np_arr     = np.frombuffer(raw, np.uint8)
+            full_frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            if full_frame is None:
+                continue
+
+            # Resize a 640×360 para detección (4× menos píxeles)
+            small_frame = cv2.resize(full_frame, (640, 360),
+                                    interpolation=cv2.INTER_LINEAR)
+
+            with self._frame_lock:
+                if self.latest_frame_time is not None and \
+                self.latest_frame_time.nanoseconds == stamp_ns:
+                    self.latest_frame       = small_frame   # ← ya reducido
+                    self.latest_full_frame  = full_frame    # ← para anotar si hay ArUco
+            last_stamp_ns = stamp_ns
 
     # ─────────────────────────────────────────────────────────────────────
-    #  CICLO PRINCIPAL: ArUco + Kalman + Mapa  (timer 30 Hz)
+    #  HELPERS DE CALIDAD DE MARCADOR
     # ─────────────────────────────────────────────────────────────────────
-
     def _get_roi(self, frame: np.ndarray):
-        """
-        Devuelve (roi_frame, ox, oy) donde ox,oy es el offset del ROI
-        en el frame original, para poder convertir coordenadas de vuelta.
-        """
         h, w = frame.shape[:2]
-        mx = int(w * self.ROI_MARGIN)
-        my = int(h * self.ROI_MARGIN)
-        roi = frame[my:h-my, mx:w-mx]
-        return roi, mx, my
+        mx   = int(w * self.ROI_MARGIN)
+        my   = int(h * self.ROI_MARGIN)
+        return frame[my:h-my, mx:w-mx], mx, my
 
     def _is_marker_usable(self, pts: np.ndarray) -> bool:
-        """
-        Rechaza marcadores muy oblicuos o muy pequeños.
-        pts: (4,2) — esquinas TL, TR, BR, BL
-        """
-        # Área del marcador en px² (cross product)
-        v1 = pts[1] - pts[0]
-        v2 = pts[3] - pts[0]
+        v1   = pts[1] - pts[0];  v2 = pts[3] - pts[0]
         area = abs(v1[0]*v2[1] - v1[1]*v2[0])
-        
-        # Ratio de aspecto: si está muy aplastado, está muy de lado
+
         top    = np.linalg.norm(pts[1] - pts[0])
         bottom = np.linalg.norm(pts[2] - pts[3])
         left   = np.linalg.norm(pts[3] - pts[0])
         right  = np.linalg.norm(pts[2] - pts[1])
-        
-        w_avg = (top + bottom) / 2.0
-        h_avg = (left + right) / 2.0
-        
+        w_avg  = (top + bottom) / 2.0
+        h_avg  = (left + right) / 2.0
+
         if w_avg < 1e-3 or h_avg < 1e-3:
             return False
-        
-        aspect_ratio = min(w_avg, h_avg) / max(w_avg, h_avg)
-        
-        # Rechazar si está más de ~55° de lado (aspect < 0.57 ≈ cos(55°))
-        MIN_ASPECT  = 0.40   # ajustable — más alto = más estricto
-        MIN_AREA_PX = 400    # píxeles cuadrados mínimos
-        
-        return aspect_ratio >= MIN_ASPECT and area >= MIN_AREA_PX
-    
+
+        aspect = min(w_avg, h_avg) / max(w_avg, h_avg)
+        return aspect >= 0.40 and area >= 400
+
     def _marker_quality_weight(self, pts: np.ndarray) -> float:
-        """
-        Devuelve un multiplicador para R: 1.0 = perfecto, >1 = más incertidumbre.
-        Penaliza marcadores oblicuos.
-        """
         top   = np.linalg.norm(pts[1] - pts[0])
         left  = np.linalg.norm(pts[3] - pts[0])
-        w_avg = (top + np.linalg.norm(pts[2] - pts[3])) / 2.0
+        w_avg = (top  + np.linalg.norm(pts[2] - pts[3])) / 2.0
         h_avg = (left + np.linalg.norm(pts[2] - pts[1])) / 2.0
-        
+
         if w_avg < 1e-3 or h_avg < 1e-3:
             return 10.0
-        
-        aspect = min(w_avg, h_avg) / max(w_avg, h_avg)
-        # aspect=1.0 → peso 1x,  aspect=0.4 → peso ~6x
-        return 1.0 / max(aspect ** 2, 0.04)
 
+        aspect = min(w_avg, h_avg) / max(w_avg, h_avg)
+        return 1.0 / max(aspect**2, 0.04)
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  HILO DE DETECCIÓN ArUco (15 Hz)
+    # ─────────────────────────────────────────────────────────────────────
     def _detection_loop(self):
-        """Hilo dedicado a detección ArUco — no bloquea ROS."""
-        last_process_time = 0.0
-        DETECT_SCALE = 0.5   # detectar a 640×360 en vez de 1280×720
+        PERIOD = 1.0 / 15.0
 
         while rclpy.ok():
-            # ── Throttle: procesar máximo a 15 Hz ──────────────────────────
-            now = time.monotonic()
-            elapsed = now - last_process_time
-            if elapsed < 0.066:
-                time.sleep(0.066 - elapsed)
-                continue
-            last_process_time = time.monotonic()
+            t0 = time.monotonic()
 
-            # ── Tomar siempre el frame más reciente ─────────────────────────
             with self._frame_lock:
-                frame      = self.latest_frame
-                header     = self.latest_header
-                frame_time = self.latest_frame_time
+                frame       = self.latest_frame        # ya es 640×360
+                full_frame  = getattr(self, 'latest_full_frame', None)
+                header      = self.latest_header
+                frame_time  = self.latest_frame_time
 
             if frame is None:
+                time.sleep(PERIOD)
                 continue
 
-            # ── Descartar frame viejo ────────────────────────────────────────
             if frame_time is not None:
                 age = (self.get_clock().now() - frame_time).nanoseconds * 1e-9
                 if age > 0.12:
+                    _sleep_remainder(t0, PERIOD)
                     continue
 
-            # ── Detección a resolución reducida ─────────────────────────────
-            frame_small = cv2.resize(frame, None, fx=DETECT_SCALE, fy=DETECT_SCALE,
-                                    interpolation=cv2.INTER_LINEAR)
-            gray_small  = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY)
-            gray_roi, roi_ox, roi_oy = self._get_roi(gray_small)
-            corners, ids, _ = self.detector.detectMarkers(gray_roi)
+            # ── Detección sobre frame pequeño (640×360) ──────────────────────
+            # cvtColor ya es 4× más rápido; ROI también es pequeño
+            gray                     = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray_roi, roi_ox, roi_oy = self._get_roi(gray)
+            corners, ids, _          = self.detector.detectMarkers(gray_roi)
 
-            # ── Escalar corners + offset de vuelta a resolución original ────
+            # Escalar corners al frame de anotación (full_frame 1280×720)
+            SCALE = 2.0   # 640→1280
             if ids is not None and corners:
-                offset = np.array([roi_ox, roi_oy], dtype=np.float32)
-                corners = [(c + offset) / DETECT_SCALE for c in corners]
+                offset  = np.array([roi_ox, roi_oy], dtype=np.float32)
+                corners = [(c + offset) * SCALE for c in corners]
 
-            # ── Copiar frame original SOLO si hay detecciones o hace falta anotar
-            annotated = frame.copy()
+            has_detections = ids is not None and len(ids) > 0
 
-            self.visible_ids  = []
-            poses_aruco       = []
+            if not has_detections:
+                self.last_valid_id = None
+                self.same_id_count = 0
+                with self._vis_lock:
+                    self._visible_ids = []
+                # Sin ArUcos: encolar frame pequeño directamente, sin copy de full
+                try:
+                    pub = cv2.resize(frame, (640, 360))  # ya es 640×360, noop
+                    cv2.putText(pub, 'No ArUco', (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    if self._annotated_queue.full():
+                        self._annotated_queue.get_nowait()
+                    self._annotated_queue.put_nowait((pub, header))
+                except (queue.Empty, queue.Full):
+                    pass
+                _sleep_remainder(t0, PERIOD)
+                continue
 
-            if ids is not None and len(ids) > 0:
-                aruco.drawDetectedMarkers(annotated, corners, ids)
-                self.visible_ids = [int(ids[m][0]) for m in range(len(ids))]
-
-                for m_idx in range(len(corners)):
-                    pts = np.squeeze(corners[m_idx])
-                    if pts.shape != (4, 2):
-                        continue
-
-                    marker_id = int(ids[m_idx][0])
-                    cx_m = int(np.mean(pts[:, 0]))
-                    cy_m = int(np.mean(pts[:, 1]))
-
-                    if not self._is_marker_usable(pts):
-                        continue
-
-                    cv2.circle(annotated, (cx_m, cy_m), 6, (0, 255, 0), -1)
-
-                    img_pts = pts.astype(np.float64)
-                    success, rvec, tvec = cv2.solvePnP(
-                        self.obj_points, img_pts,
-                        CAMERA_MATRIX, DIST_COEFFS,
-                        flags=cv2.SOLVEPNP_IPPE_SQUARE)
-
-                    if success:
-                        result = estimate_robot_pose(tvec, rvec, marker_id, pts)
-                        if result is not None:
-                            rx, ry, rth, dist_h, bearing = result
-                            quality = self._marker_quality_weight(pts)
-                            poses_aruco.append((rx, ry, rth, quality))
-                            cv2.putText(annotated,
-                                f"ID:{marker_id}  d={dist_h:.2f}m",
-                                (int(pts[0][0]), int(pts[0][1]) - 20),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
-                        else:
-                            cv2.putText(annotated, f"ID:{marker_id} (no en mapa)",
-                                (cx_m - 20, cy_m - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 165, 255), 1)
-                    else:
-                        cv2.putText(annotated, f"ID:{marker_id} (PnP fail)",
-                            (cx_m - 20, cy_m - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
-
-                if poses_aruco:
-                    best = min(poses_aruco,
-                            key=lambda p: math.hypot(p[0] - self.kf_x, p[1] - self.kf_y)
-                                            * p[3])
-                    with self._kf_lock:
-                        old_R = self.kf.R.copy()
-                        weight = best[3]
-                        self.kf.R = np.diag([KF_R_XY*weight, KF_R_XY*weight, KF_R_THETA*weight])
-                        self.kf.update(np.array([best[0], best[1], best[2]]))
-                        self.kf.R = old_R
-                        self.kf_x, self.kf_y, self.kf_theta = self.kf.state
-
+            # ── Anotar sobre full_frame (1280×720) ───────────────────────────
+            # Solo hacemos .copy() cuando hay ArUcos — caso poco frecuente
+            if full_frame is not None:
+                annotated = full_frame.copy()
             else:
-                cv2.putText(annotated, 'No ArUco', (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                annotated = cv2.resize(frame, (1280, 720))
 
-            # ── Encolar frame anotado (resolución reducida para ahorrar ancho de banda)
+            aruco.drawDetectedMarkers(annotated, corners, ids)
+
+            new_visible = []
+            poses_aruco = []
+            best_aruco = None
+            best_score  = float('inf')
+
+            for m_idx in range(len(corners)):
+                pts = np.squeeze(corners[m_idx])
+                if pts.shape != (4, 2):
+                    continue
+
+                marker_id = int(ids[m_idx][0])
+                new_visible.append(marker_id)
+                cx_m = int(np.mean(pts[:, 0]))
+                cy_m = int(np.mean(pts[:, 1]))
+
+                if not self._is_marker_usable(pts):
+                    cv2.putText(annotated, f'ID:{marker_id} (skipped)',
+                        (cx_m - 20, cy_m - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (128, 128, 0), 1)
+                    continue
+
+                cv2.circle(annotated, (cx_m, cy_m), 6, (0, 255, 0), -1)
+
+                img_pts = pts.astype(np.float64)
+                success, rvec, tvec = cv2.solvePnP(
+                    self.obj_points, img_pts,
+                    CAMERA_MATRIX, DIST_COEFFS,
+                    flags=cv2.SOLVEPNP_IPPE_SQUARE)
+
+                if success:
+                    result = estimate_robot_pose(
+                        tvec,
+                        rvec,
+                        marker_id,
+                    )
+
+                    if result is not None:
+                        rx, ry, rth, dist_h, _, view_angle = result
+                        perspective_penalty = 1.0 + (view_angle / 45.0) ** 2
+
+                        quality = (
+                            self._marker_quality_weight(pts)
+                            * perspective_penalty
+                        )
+
+                        score = dist_h * quality
+
+                        if score < best_score:
+                            best_score = score
+                            best_aruco = (rx, ry, rth, quality, marker_id, dist_h)
+
+                        self.get_logger().info(
+                            f'[ArUco {marker_id}] robot=({rx:.2f}, {ry:.2f}) '
+                            f'th={math.degrees(rth):.1f}° dist={dist_h:.2f}m '
+                            f'kf=({self.kf_x:.2f}, {self.kf_y:.2f})')
+
+                        poses_aruco.append((rx, ry, rth, quality))
+
+                        cv2.putText(annotated,
+                            f'ID:{marker_id}  d={dist_h:.2f}m',
+                            (int(pts[0][0]), int(pts[0][1]) - 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
+                    else:
+                        cv2.putText(annotated, f'ID:{marker_id} (no en mapa)',
+                            (cx_m - 20, cy_m - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 165, 255), 1)
+        
+            with self._vis_lock:
+                self._visible_ids = new_visible
+
+            if best_aruco is not None:
+                rx, ry, rth, quality, used_id, dist_h = best_aruco
+
+                if used_id == self.last_valid_id:
+                    self.same_id_count += 1
+                else:
+                    self.last_valid_id = used_id
+                    self.same_id_count = 1
+
+                if used_id not in self.aruco_history:
+                    self.aruco_history[used_id] = deque(maxlen=10)
+
+                self.aruco_history[used_id].append(
+                    (rx, ry, rth)
+                )
+
+                self.get_logger().info(
+                    f'[ARUCO] ID:{used_id} '
+                    f'frames={self.same_id_count}/{self.MIN_CONSECUTIVE_ARUCO}'
+                )
+
+                if (
+                    self.same_id_count >= self.MIN_CONSECUTIVE_ARUCO
+                    and len(self.aruco_history[used_id]) >= 5
+                ):
+
+                    hist = self.aruco_history[used_id]
+
+                    mean_x = np.mean([p[0] for p in hist])
+                    mean_y = np.mean([p[1] for p in hist])
+
+                    mean_sin = np.mean([math.sin(p[2]) for p in hist])
+                    mean_cos = np.mean([math.cos(p[2]) for p in hist])
+
+                    mean_th = math.atan2(mean_sin, mean_cos)
+
+                    std_x = np.std([p[0] for p in hist])
+                    std_y = np.std([p[1] for p in hist])
+
+                    if std_x < 0.05 and std_y < 0.05:
+
+                        self.get_logger().info(
+                            f'[KF UPDATE] usando ID:{used_id}'
+                        )
+
+                        with self._kf_lock:
+                            old_R = self.kf.R.copy()
+
+                            self.kf.R = np.diag([
+                                KF_R_XY * quality,
+                                KF_R_XY * quality,
+                                KF_R_THETA * quality
+                            ])
+
+                            self.kf.update(
+                                np.array([
+                                    mean_x,
+                                    mean_y,
+                                    mean_th
+                                ])
+                            )
+
+                            self.kf.R = old_R
+
+                            self.kf_x, self.kf_y, self.kf_theta = self.kf.state
             try:
-                pub_frame = cv2.resize(annotated, (640, 360),
-                                    interpolation=cv2.INTER_LINEAR)
-                self._annotated_queue.put_nowait((pub_frame, header))
-            except queue.Full:
+                if self._annotated_queue.full():
+                    self._annotated_queue.get_nowait()
+                self._annotated_queue.put_nowait((annotated, header))
+            except (queue.Empty, queue.Full):
                 pass
 
+            _sleep_remainder(t0, PERIOD)
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  PUBLICAR MARKERS ARUCO EN RVIZ (solo al inicio — latched)
+    # ─────────────────────────────────────────────────────────────────────
     def _publish_aruco_markers(self):
-        """
-        Publica los ArUcos como cubos en RViz, en coordenadas centradas
-        (mismo origen que /aruco/pose_center).
-        """
-        ma = MarkerArray()
+        ma    = MarkerArray()
         stamp = self.get_clock().now().to_msg()
 
+        with self._vis_lock:
+            vis = set(self._visible_ids)
+
         for marker_id, (mx, my, m_yaw) in ARUCO_MAP.items():
-            # Convertir a coordenadas centradas
             cx = mx - self.MAP_OFFSET_X
             cy = my - self.MAP_OFFSET_Y
 
             m = Marker()
             m.header.stamp    = stamp
-            m.header.frame_id = 'odom'   # mismo frame que usa el planner
+            m.header.frame_id = 'odom'
             m.ns     = 'aruco'
             m.id     = marker_id
             m.type   = Marker.CUBE
             m.action = Marker.ADD
 
-            m.pose.position.x = cx
-            m.pose.position.y = cy
-            m.pose.position.z = 0.1   # ligeramente sobre el suelo
-
-            # Orientación del marcador
+            m.pose.position.x    = cx
+            m.pose.position.y    = cy
+            m.pose.position.z    = 0.1
             m.pose.orientation.z = math.sin(m_yaw / 2)
             m.pose.orientation.w = math.cos(m_yaw / 2)
 
-            m.scale.x = 0.05
-            m.scale.y = 0.05
-            m.scale.z = 0.20
+            m.scale.x = 0.05;  m.scale.y = 0.05;  m.scale.z = 0.20
 
-            # Verde si fue visto recientemente, gris si no
-            if marker_id in self.visible_ids:
+            if marker_id in vis:
                 m.color = ColorRGBA(r=0.2, g=0.9, b=0.2, a=1.0)
             else:
                 m.color = ColorRGBA(r=0.5, g=0.5, b=0.5, a=0.6)
 
             ma.markers.append(m)
 
-            # Texto con el ID encima
             t = Marker()
-            t.header = m.header
-            t.ns     = 'aruco_labels'
-            t.id     = marker_id + 100
-            t.type   = Marker.TEXT_VIEW_FACING
-            t.action = Marker.ADD
-            t.pose.position.x = cx
-            t.pose.position.y = cy
-            t.pose.position.z = 0.35
+            t.header            = m.header
+            t.ns                = 'aruco_labels'
+            t.id                = marker_id + 100
+            t.type              = Marker.TEXT_VIEW_FACING
+            t.action            = Marker.ADD
+            t.pose.position.x   = cx
+            t.pose.position.y   = cy
+            t.pose.position.z   = 0.35
             t.pose.orientation.w = 1.0
-            t.scale.z = 0.12
-            t.color   = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
-            t.text    = f'ID{marker_id}'
+            t.scale.z           = 0.12
+            t.color             = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
+            t.text              = f'ID{marker_id}'
             ma.markers.append(t)
 
         self.aruco_markers_pub.publish(ma)
 
+    # ─────────────────────────────────────────────────────────────────────
+    #  TIMER 30 Hz
+    # ─────────────────────────────────────────────────────────────────────
     def _publish_only(self):
-        """Timer de ROS — solo publica pose, no procesa imagen."""
         self._publish_pose()
 
-    # ─────────────────────────────────────────────────────────────────────
-    #  PUBLICAR POSE FUSIONADA
-    # ─────────────────────────────────────────────────────────────────────
     def _publish_pose(self):
+        # Extraer mínimo bajo lock
         with self._kf_lock:
-            kf_x, kf_y, kf_theta = self.kf_x, self.kf_y, self.kf_theta
-            P = self.kf.P.copy()
-            # usar kf_x, kf_y, kf_theta, P en lugar de self.kf_x etc.
-            msg = PoseWithCovarianceStamped()
-            msg.header.stamp    = self.get_clock().now().to_msg()
-            msg.header.frame_id = 'map'
-            msg.pose.pose.position.x    = kf_x
-            msg.pose.pose.position.y    = kf_y
-            msg.pose.pose.orientation.z = math.sin(kf_theta / 2)
-            msg.pose.pose.orientation.w = math.cos(kf_theta / 2)
-            P = self.kf.P
-            msg.pose.covariance[0]  = P[0, 0]
-            msg.pose.covariance[7]  = P[1, 1]
-            msg.pose.covariance[35] = P[2, 2]
+            kf_x    = self.kf_x
+            kf_y    = self.kf_y
+            kf_theta = self.kf_theta
+            p00     = self.kf.P[0, 0]
+            p11     = self.kf.P[1, 1]
+            p35     = self.kf.P[2, 2]
 
-            # Versión centrada: resta el offset para que el origen quede en el centro
-            msg_c = PoseWithCovarianceStamped()
-            msg_c.header = msg.header
-            msg_c.pose.covariance = msg.pose.covariance
-            msg_c.pose.pose.position.x    = kf_x - self.MAP_OFFSET_X
-            msg_c.pose.pose.position.y    = kf_y - self.MAP_OFFSET_Y
-            msg_c.pose.pose.orientation   = msg.pose.pose.orientation
-            self.pose_centered_pub.publish(msg_c)
+        # Construir mensaje completamente fuera del lock
+        stamp = self.get_clock().now().to_msg()
+
+        cov     = [0.0] * 36
+        cov[0]  = p00
+        cov[7]  = p11
+        cov[35] = p35
+
+        msg_c = PoseWithCovarianceStamped()
+        msg_c.header.stamp    = stamp
+        msg_c.header.frame_id = 'map'
+        #msg_c.pose.pose.position.x    = - (kf_x - self.MAP_OFFSET_X)
+        #msg_c.pose.pose.position.y    = - (kf_y - self.MAP_OFFSET_Y)
+        msg_c.pose.pose.position.x    = kf_x - self.MAP_OFFSET_X
+        msg_c.pose.pose.position.y    = kf_y - self.MAP_OFFSET_Y
+
+        theta_pub = wrap_angle(kf_theta + math.pi)
+        
+        msg_c.pose.pose.orientation.z = math.sin(kf_theta / 2)
+        msg_c.pose.pose.orientation.w = math.cos(kf_theta / 2)
+        msg_c.pose.covariance         = cov
+
+        self.pose_centered_pub.publish(msg_c)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  UTILIDAD: dormir el tiempo restante del período
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _sleep_remainder(t_start: float, period: float):
+    """Duerme lo que queda del período sin acumular deriva."""
+    remaining = period - (time.monotonic() - t_start)
+    if remaining > 0.002:
+        time.sleep(remaining)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
 def main(args=None):
     rclpy.init(args=args)
     node = ArucoPoseNode()
+    # Limitar a 2 hilos del executor — los callbacks de ROS son ligeros,
+    # el trabajo pesado ya está en hilos propios (detection_loop, image_pub_loop)
+    executor = rclpy.executors.MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
