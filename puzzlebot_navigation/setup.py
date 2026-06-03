@@ -29,6 +29,7 @@ setup(
             'semantic_planner    = puzzlebot_navigation.semantic_planner:main',
             'bug2_monitor        = puzzlebot_navigation.bug2_monitor:main',
             'waypoint_controller = puzzlebot_navigation.waypoint_controller:main',
+            'mission_manager     = puzzlebot_navigation.mission_manager:main',
         ],
     },
 )

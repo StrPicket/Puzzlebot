@@ -23,13 +23,13 @@ import math
 # ═══════════════════════════════════════════════════════════════════════════
 
 CAMERA_MATRIX = np.array([
-    [1.32035342e+03, 0.0           , 6.31747899e+02],
-    [0.00000000e+00, 1.32353022e+03, 2.96231877e+02],
+    [771.25742667,   0.0,         684.88203376],
+    [  0.0,         773.15472704,  361.72143901],
     [  0.0,           0.0,           1.0      ]
 ], dtype=np.float64)
 
 DIST_COEFFS = np.array(
-    [[4.01198628e-01, -1.93104010e+00, -1.77289440e-02, -3.22599073e-04, 4.79884803e+00]],
+    [[-4.12196743e-01,  2.39129843e-01,  9.29550695e-03,  6.35843547e-05, -7.68077937e-02]],
     dtype=np.float64
 )
 
@@ -793,10 +793,10 @@ class ArucoPoseNode(Node):
         msg_c = PoseWithCovarianceStamped()
         msg_c.header.stamp    = stamp
         msg_c.header.frame_id = 'map'
-        #msg_c.pose.pose.position.x    = - (kf_x - self.MAP_OFFSET_X)
-        #msg_c.pose.pose.position.y    = - (kf_y - self.MAP_OFFSET_Y)
-        msg_c.pose.pose.position.x    = 0.0 #kf_x - self.MAP_OFFSET_X
-        msg_c.pose.pose.position.y    = 0.0 #kf_y - self.MAP_OFFSET_Y
+        msg_c.pose.pose.position.x    = - (kf_x - self.MAP_OFFSET_X)
+        msg_c.pose.pose.position.y    = - (kf_y - self.MAP_OFFSET_Y)
+        #msg_c.pose.pose.position.x    = 0.0 #kf_x - self.MAP_OFFSET_X
+        #msg_c.pose.pose.position.y    = 0.0 #kf_y - self.MAP_OFFSET_Y
 
         theta_pub = wrap_angle(kf_theta + math.pi)
         

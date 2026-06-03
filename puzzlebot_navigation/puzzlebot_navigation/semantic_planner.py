@@ -74,8 +74,8 @@ from collections import defaultdict
 #  CONFIGURACIÓN
 # ═══════════════════════════════════════════════════════════════════════
 
-SEMANTIC_MAP_PATH = "/home/juanjo/semantic_map.png"
-ROUTE_MAP_PATH    = "/home/juanjo/route_map.png"
+SEMANTIC_MAP_PATH = "/home/strpicket/semantic_map.png"
+ROUTE_MAP_PATH    = "/home/strpicket/route_map.png"
 MAP_RESOLUTION    = 0.05        # m/pixel
 
 # Radio en píxeles para considerar que el robot "está sobre" una ruta

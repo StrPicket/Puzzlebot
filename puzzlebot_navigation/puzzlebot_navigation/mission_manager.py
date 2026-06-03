@@ -66,8 +66,8 @@ import math
 #  CONFIGURACIÓN
 # ═══════════════════════════════════════════════════════════════════════
 
-SEMANTIC_MAP_PATH = "/home/juanjo/semantic_map.png"
-ROUTE_MAP_PATH    = "/home/juanjo/route_map.png"
+SEMANTIC_MAP_PATH = "/home/strpicket/semantic_map.png"
+ROUTE_MAP_PATH    = "/home/strpicket/route_map.png"
 MAP_RESOLUTION    = 0.05   # m/pixel — debe coincidir con semantic_planner
 
 # Submuestreo de waypoints de búsqueda (cada N píxeles de ruta)
