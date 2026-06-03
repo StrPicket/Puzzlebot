@@ -46,6 +46,7 @@ SISTEMAS DE COORDENADAS
 Tópicos suscritos:
   /odom        — nav_msgs/Odometry
   /goal_input  — std_msgs/String  ("carga" | "descarga" | "racks" | "x y")
+  /aruco/pose_centered  — geometry_msgs/PoseWithCovarianceStamped
 
 Tópicos publicados:
   /plan        — nav_msgs/Path  (frame_id = "odom")
@@ -59,6 +60,7 @@ from rclpy.node import Node
 from rclpy import qos
 from nav_msgs.msg import Path, Odometry
 from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseWithCovarianceStamped
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
@@ -72,8 +74,8 @@ from collections import defaultdict
 #  CONFIGURACIÓN
 # ═══════════════════════════════════════════════════════════════════════
 
-SEMANTIC_MAP_PATH = "/home/strpicket/semantic_map.png"
-ROUTE_MAP_PATH    = "/home/strpicket/route_map.png"
+SEMANTIC_MAP_PATH = "/home/juanjo/semantic_map.png"
+ROUTE_MAP_PATH    = "/home/juanjo/route_map.png"
 MAP_RESOLUTION    = 0.05        # m/pixel
 
 # Radio en píxeles para considerar que el robot "está sobre" una ruta
@@ -422,6 +424,7 @@ class SemanticPlannerNode(Node):
         self.odom_ok   = False
         self.path_msg  = None
         self.goal_desc = None
+        self.kf_pose_active = False
 
         # ── ROS ───────────────────────────────────────────────────────
         self.plan_pub = self.create_publisher(Path, '/plan', 10)
@@ -429,6 +432,17 @@ class SemanticPlannerNode(Node):
         self.odom_sub = self.create_subscription(
             Odometry, '/odom', self._odom_cb,
             qos.qos_profile_sensor_data)
+        
+        self.kf_pose_sub = self.create_subscription(
+            PoseWithCovarianceStamped,'/aruco/pose_centered',
+            self._kf_pose_callback,10)
+        
+        self.REPLAN_DIST_THRESH = 0.40
+
+        self.current_wp_idx = 0
+
+        self.status_sub = self.create_subscription(
+            String, '/nav/status', self._status_callback, 10)
 
         self.goal_sub = self.create_subscription(
             String, '/goal_input', self._goal_input_cb, 10)
@@ -449,17 +463,63 @@ class SemanticPlannerNode(Node):
     # ─────────────────────────────────────────────────────────────────
 
     def _odom_cb(self, msg: Odometry):
+        if self.kf_pose_active:
+            return   # KF tiene prioridad
         self.robot_ox = msg.pose.pose.position.x
         self.robot_oy = msg.pose.pose.position.y
         if not self.odom_ok:
             self.odom_ok = True
             self.get_logger().info(
-                f'Primera odometría — '
-                f'odom=({self.robot_ox:.2f}, {self.robot_oy:.2f}) m')
+                f'Odometría cruda recibida (fallback) — '
+                f'({self.robot_ox:.2f}, {self.robot_oy:.2f}) m')
+            
+    def _kf_pose_callback(self, msg: PoseWithCovarianceStamped):
+        new_x = msg.pose.pose.position.x
+        new_y = msg.pose.pose.position.y
+
+        # Actualizar pose
+        prev_x, prev_y = self.robot_ox, self.robot_oy
+        self.robot_ox = new_x
+        self.robot_oy = new_y
+        self.kf_pose_active = True
+        if not self.odom_ok:
+            self.odom_ok = True
+
+        # En lugar de comparar contra plan_origin, comparar contra el waypoint activo
+        if self.path_msg is None or self.goal_desc is None:
+            return
+
+        poses = self.path_msg.poses
+        if not poses or self.current_wp_idx >= len(poses):
+            return
+
+        # Posición del waypoint que debería estar siguiendo ahora
+        wp = poses[self.current_wp_idx]
+        dist_to_current_wp = math.hypot(
+            new_x - wp.pose.position.x,
+            new_y - wp.pose.position.y
+        )
+
+        if dist_to_current_wp > self.REPLAN_DIST_THRESH:
+            self.get_logger().info(
+                f'Corrección ArUco: {dist_to_current_wp:.2f} m del wp activo → replaneando...')
+            goal_px = self._parse_goal(self.goal_desc)
+            if goal_px is not None:
+                self._run_astar(goal_px, description=self.goal_desc)
 
     # ─────────────────────────────────────────────────────────────────
     #  ENTRADA DE DESTINO
     # ─────────────────────────────────────────────────────────────────
+
+    def _status_callback(self, msg: String):
+        try:
+            for part in msg.data.split('|'):
+                part = part.strip()
+                if part.startswith('wp='):
+                    self.current_wp_idx = int(part.split('=')[1].split('/')[0])
+                    break
+        except Exception:
+            pass
 
     def _goal_input_cb(self, msg: String):
         raw = msg.data.strip().lower()
@@ -478,6 +538,8 @@ class SemanticPlannerNode(Node):
         for name in ZONE_NAMES:
             if name in words:
                 center = get_zone_center_px(self.zones[name])
+                if name == "racks":
+                    center = (self.conv.W // 2, self.conv.H // 2)  # zona racks = centro del mapa
                 if center is None:
                     self.get_logger().warn(f"Zona '{name}' vacía en el mapa")
                     return None
