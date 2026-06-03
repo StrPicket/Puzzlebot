@@ -22,6 +22,7 @@ import rclpy
 from rclpy import qos
 from rclpy.node import Node
 from nav_msgs.msg import Path, Odometry
+from geometry_msgs.msg import PoseWithCovarianceStamped
 from geometry_msgs.msg import Twist
 from std_msgs.msg import Bool, String
 from tf_transformations import euler_from_quaternion
@@ -33,18 +34,18 @@ import math
 # ═══════════════════════════════════════════════════════════════════════
 
 # Ganancias de control
-KP_V      = 0.23    # proporcional velocidad lineal
-KI_V      = 0.20    # integral velocidad lineal
-KP_W      = 0.20    # proporcional velocidad angular
-KV_W      = 0.05    # amortiguación velocidad angular (usa w_robot de odom)
+KP_V      = 0.20    # proporcional velocidad lineal
+KI_V      = 0.17    # integral velocidad lineal
+KP_W      = 0.15    # proporcional velocidad angular
+KV_W      = 0.02    # amortiguación velocidad angular (usa w_robot de odom)
 
 # Límites de velocidad
-V_MAX     = 0.22    # m/s
-OMEGA_MAX = 0.30    # rad/s
+V_MAX     = 0.15    # m/s
+OMEGA_MAX = 0.15    # rad/s
 
 # Tolerancias
-GOAL_DIST_TOL  = 0.05   # m — radio para considerar waypoint alcanzado
-ANGLE_PRIORITY = math.radians(3)  # rad (~3°) — umbral para activar movimiento lineal
+GOAL_DIST_TOL  = 0.12   # m — radio para considerar waypoint alcanzado
+ANGLE_PRIORITY = math.radians(5)  # rad (~5°) — umbral para activar movimiento lineal
 
     
 # ═══════════════════════════════════════════════════════════════════════
@@ -77,8 +78,16 @@ class WaypointControllerNode(Node):
         self.status_pub   = self.create_publisher(String, '/nav/status', 10)
 
         # ── Subscribers ───────────────────────────────────────────────
+        self.cancel_sub = self.create_subscription(Bool, '/nav/cancel', self._cancel_cb, 10)
+
         self.plan_sub = self.create_subscription(
             Path, '/plan', self._plan_callback, 10)
+        
+        self.kf_pose_active = False
+
+        self.kf_pose_sub = self.create_subscription(
+            PoseWithCovarianceStamped, '/aruco/pose_centered',
+            self._kf_pose_callback, 10)
 
         self.odom_sub = self.create_subscription(
             Odometry, '/odom', self._odom_callback,
@@ -114,6 +123,13 @@ class WaypointControllerNode(Node):
     #  CALLBACKS
     # ─────────────────────────────────────────────────────────────────
 
+    def _cancel_cb(self, msg: Bool):
+        if msg.data:
+            self.waypoints = []
+            self.wp_idx = 0
+            self.int_error_d = 0.0
+            self.state = 'WAIT_PLAN'
+
     def _plan_callback(self, msg: Path):
         if not msg.poses:
             return
@@ -128,17 +144,30 @@ class WaypointControllerNode(Node):
             self.state = 'ROTATE_TO_GOAL'
             self.get_logger().info(
                 f'Plan recibido: {len(self.waypoints)} waypoints — iniciando navegación')
-
-    def _odom_callback(self, msg: Odometry):
+            
+    def _kf_pose_callback(self, msg: PoseWithCovarianceStamped):
+        from tf_transformations import euler_from_quaternion
         self.x = msg.pose.pose.position.x
         self.y = msg.pose.pose.position.y
-
         q = msg.pose.pose.orientation
         _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
         self.theta = yaw
+        self.kf_pose_active = True
+        # Nota: w_robot no viene en PoseWithCovarianceStamped,
+        # se sigue tomando de /odom para la amortiguación angular
 
-        # Velocidad angular del robot (útil para amortiguación)
+    def _odom_callback(self, msg: Odometry):
+        # w_robot siempre se toma de /odom (velocidad instantánea)
         self.w_robot = msg.twist.twist.angular.z
+
+        if self.kf_pose_active:
+            return   # pose ya actualizada por KF
+
+        self.x = msg.pose.pose.position.x
+        self.y = msg.pose.pose.position.y
+        q = msg.pose.pose.orientation
+        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        self.theta = yaw
 
     def _bug2_callback(self, msg: Bool):
         prev = self.bug2_active
@@ -168,6 +197,7 @@ class WaypointControllerNode(Node):
             f'bug2={self.bug2_active} | '
             f'x={self.x:.2f} y={self.y:.2f} th={math.degrees(self.theta):.1f}°'
         )
+        
         self.status_pub.publish(status)
 
         cmd = Twist()
