@@ -22,7 +22,7 @@ import numpy as np
 # ═══════════════════════════════════════════════════════════════════════
 
 SEMANTIC_MAP_PATH       = "/home/strpicket/semantic_map.png"
-MAP_PATH                = "/home/strpicket/map.png" 
+MAP_PATH                = "/home/strpicket/route_map.png" 
 MAP_RESOLUTION = 0.05   # m/pixel — mismo valor que semantic_planner
 
 

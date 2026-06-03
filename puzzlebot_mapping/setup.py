@@ -24,8 +24,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'mapeo  = puzzlebot_mapping.mapeo:main',
-            'mapeoSim     = puzzlebot_mapping.mapeoSim:main',
+            'mapeo          = puzzlebot_mapping.mapeo:main',
+            'mapeoSim       = puzzlebot_mapping.mapeoSim:main',
+            'map_publisher  = puzzlebot_mapping.map_publisher:main',
         ],  
     },
 )
