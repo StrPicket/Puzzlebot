@@ -795,13 +795,13 @@ class ArucoPoseNode(Node):
         msg_c.header.frame_id = 'map'
         #msg_c.pose.pose.position.x    = - (kf_x - self.MAP_OFFSET_X)
         #msg_c.pose.pose.position.y    = - (kf_y - self.MAP_OFFSET_Y)
-        msg_c.pose.pose.position.x    = kf_x - self.MAP_OFFSET_X
-        msg_c.pose.pose.position.y    = kf_y - self.MAP_OFFSET_Y
+        msg_c.pose.pose.position.x    = 0.0 #kf_x - self.MAP_OFFSET_X
+        msg_c.pose.pose.position.y    = 0.0 #kf_y - self.MAP_OFFSET_Y
 
         theta_pub = wrap_angle(kf_theta + math.pi)
         
-        msg_c.pose.pose.orientation.z = math.sin(kf_theta / 2)
-        msg_c.pose.pose.orientation.w = math.cos(kf_theta / 2)
+        msg_c.pose.pose.orientation.z = math.sin(theta_pub / 2)
+        msg_c.pose.pose.orientation.w = math.cos(theta_pub / 2)
         msg_c.pose.covariance         = cov
 
         self.pose_centered_pub.publish(msg_c)
