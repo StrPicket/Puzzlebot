@@ -5,6 +5,7 @@ from sensor_msgs.msg import Image
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Header
 from std_msgs.msg import Float32
+from std_msgs.msg import Bool
 from geometry_msgs.msg import Twist
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
@@ -38,6 +39,8 @@ class centerQR(Node):
         # ── Publishers / Subscribers ──────────────────────────────────────
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
         self.image_pub = self.create_publisher(CompressedImage, '/qr/image_detected/compressed', 10)
+        self.qr_detected_pub = self.create_publisher(Bool, '/qr/detected', 10)
+        self.qr_centered_pub = self.create_publisher(Bool, '/qr/centered', 10)
         
         self.get_logger().info('image pub Compressed Image')
 
@@ -48,9 +51,14 @@ class centerQR(Node):
 
         self.image_sub = self.create_subscription(
             CompressedImage, '/video_source/compressed', self.image_callback, 10)
+        
+        self.enable_sub = self.create_subscription(
+            Bool, '/center_qr/enable', self._enable_cb, 10)
 
         self.timer_odom = self.create_timer(1 / 100, self.odometria)
         self.timer_ctrl = self.create_timer(1 / 50,  self.control)
+
+        self.enabled = False
 
         # ── Estado odométrico ─────────────────────────────────────────────
         self.x = 0.0
@@ -118,6 +126,11 @@ class centerQR(Node):
         self.get_logger().info('centerQR node iniciado')
 
     # ── Callbacks imagen / encoders ───────────────────────────────────────
+
+    def _enable_cb(self, msg: Bool):
+        self.enabled = msg.data
+        if not self.enabled:
+            self.cx = None  # limpiar estado al desactivar
 
     def image_callback(self, msg: CompressedImage):
         try:
@@ -300,6 +313,15 @@ class centerQR(Node):
     def control(self):
         self.process_qr()
 
+        # Publicar detección siempre
+        det_msg = Bool()
+        det_msg.data = self.cx is not None
+        self.qr_detected_pub.publish(det_msg)
+        
+        # Solo controlar si está habilitado
+        if not self.enabled:
+            return
+
         cmd = Twist()
 
         current_time = self.get_clock().now()
@@ -328,9 +350,12 @@ class centerQR(Node):
             cmd.angular.z = 0.0
             self.int_error_r = 0.0
             self.cmd_vel_pub.publish(cmd)
+            self.qr_centered_pub.publish(Bool(data=True))
             self.get_logger().info(
                 'QR centrado y perpendicular — robot detenido')
             return
+        else:
+            self.qr_centered_pub.publish(Bool(data=False))
 
         # ── Velocidad lineal ──────────────────────────────────────────────
         # Sólo avanzamos si el QR está razonablemente centrado Y alineado.
