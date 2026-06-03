@@ -49,6 +49,15 @@ def generate_launch_description():
             output='screen',
         ),
 
+                # ── 5. Map Publisher (publica el mapa) ───────────────────
+        Node(
+            package='puzzlebot_navigation',
+            executable='mission_manager',
+            name='mission_manager',
+            output='screen',
+        ),
+
+
 
         # ── TF estático: base_link → laser ────────────────────────────
         # El LiDAR está montado apuntando hacia atrás (yaw = π)
