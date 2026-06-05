@@ -24,13 +24,13 @@ CAMERA_MATRIX = np.array([
 ], dtype=np.float64)
 
 DIST_COEFFS = np.array(
-    [[-4.12196743e-01,  2.39129843e-01,  9.29550695e-03,  6.35843547e-05,  -7.68077937e-02]],
+    [[-4.12196743e-01,  2.39129843e-01,  9.29550695e-03,  6.35843547e-05, -7.68077937e-02]],
     dtype=np.float64
 )
 
 # Lado físico del QR en metros — ajusta según tu código impreso
-QR_SIZE = 0.11
-
+QR_W = 0.0865
+QR_H = 0.0775
 
 class centerQR(Node):
     def __init__(self):
@@ -41,8 +41,6 @@ class centerQR(Node):
         self.image_pub = self.create_publisher(CompressedImage, '/qr/image_detected/compressed', 10)
         self.qr_detected_pub = self.create_publisher(Bool, '/qr/detected', 10)
         self.qr_centered_pub = self.create_publisher(Bool, '/qr/centered', 10)
-        
-        self.get_logger().info('image pub Compressed Image')
 
         self.sub_encR = self.create_subscription(
             Float32, 'VelocityEncR', self.encR_callback, qos.qos_profile_sensor_data)
@@ -50,13 +48,14 @@ class centerQR(Node):
             Float32, 'VelocityEncL', self.encL_callback, qos.qos_profile_sensor_data)
 
         self.image_sub = self.create_subscription(
-            CompressedImage, '/video_source/compressed', self.image_callback, 10)
+            CompressedImage, '/video_source/compressed', self.image_callback,
+            qos.qos_profile_sensor_data)
         
         self.enable_sub = self.create_subscription(
             Bool, '/center_qr/enable', self._enable_cb, 10)
 
         self.timer_odom = self.create_timer(1 / 100, self.odometria)
-        self.timer_ctrl = self.create_timer(1 / 50,  self.control)
+        self.timer_ctrl = self.create_timer(1 / 20,  self.control)
 
         self.enabled = False
 
@@ -97,18 +96,21 @@ class centerQR(Node):
         self.camera_width  = 1280
         self.camera_height = 720
         self.img_width     = self.camera_width
+        self.new_frame = False
+        self.frame_count = 0
 
         # ── Detector QR ───────────────────────────────────────────────────
         self.qr_detector = cv2.QRCodeDetector()
 
         # Puntos 3-D del QR en su propio marco (mismo orden que OpenCV devuelve):
         #   0=top-left, 1=top-right, 2=bottom-right, 3=bottom-left
-        half = QR_SIZE / 2.0
+        hw = QR_W / 2.0
+        hh = QR_H / 2.0
         self.obj_points = np.array([
-            [-half,  half, 0.0],
-            [ half,  half, 0.0],
-            [ half, -half, 0.0],
-            [-half, -half, 0.0],
+            [-hw,  hh, 0.0],
+            [ hw,  hh, 0.0],
+            [ hw, -hh, 0.0],
+            [-hw, -hh, 0.0],
         ], dtype=np.float64)
 
         # ── Estado de detección ───────────────────────────────────────────
@@ -138,6 +140,7 @@ class centerQR(Node):
             frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             self.latest_frame  = frame
             self.latest_header = msg.header
+            self.new_frame = True
         except Exception as e:
             self.get_logger().error(f'image_callback: {e}')
             self.latest_frame  = None
@@ -167,12 +170,16 @@ class centerQR(Node):
 
         frame = self.latest_frame.copy()
 
+        scale = 0.5
+        small = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
+        
+        retval, decoded_info, points, _ = self.qr_detector.detectAndDecodeMulti(small)
+
         # Detección — OpenCV QRCodeDetector.detect devuelve (bool, points)
         # points tiene forma (1, 4, 2) si se detecta, None si no.
-        retval, decoded_info, points, _ = self.qr_detector.detectAndDecodeMulti(frame)
 
         if retval and points is not None:
-            pts = points[0]   # (4, 2) float32: TL, TR, BR, BL
+            pts = points[0]/ scale   # (4, 2) float32: TL, TR, BR, BL
 
             # Dibujar contorno y esquinas
             pts_int = pts.astype(int)
@@ -190,10 +197,8 @@ class centerQR(Node):
 
             # Lado medio en píxeles → ratio de tamaño
             avg_side_px = float(np.mean([
-                np.linalg.norm(pts[0] - pts[1]),
-                np.linalg.norm(pts[1] - pts[2]),
-                np.linalg.norm(pts[2] - pts[3]),
-                np.linalg.norm(pts[3] - pts[0]),
+                np.linalg.norm(pts[0] - pts[1]),  # top
+                np.linalg.norm(pts[3] - pts[2]),  # bottom
             ]))
             self.ratio        = avg_side_px / self.img_width
             self.close_enough = self.ratio >= self.stop_ratio
@@ -247,7 +252,7 @@ class centerQR(Node):
 
                 # Dibujar ejes de pose
                 cv2.drawFrameAxes(frame, CAMERA_MATRIX, DIST_COEFFS,
-                                  rvec, tvec, QR_SIZE * 0.5)
+                                  rvec, tvec, QR_W * 0.5)
 
                 angle_deg = math.degrees(self.error_angle)
             else:
@@ -275,14 +280,16 @@ class centerQR(Node):
                         1.5, (0, 0, 255), 2)
 
         # Publicar imagen anotada
-        try:
-            msg = CompressedImage()
-            msg.header = self.latest_header if self.latest_header is not None else Header()
-            msg.format = 'jpeg'
-            msg.data = np.array(cv2.imencode('.jpg', frame)[1]).tobytes()
-            self.image_pub.publish(msg)
-        except Exception as e:
-            self.get_logger().error(f'Error publicando imagen: {e}')
+        self.frame_count += 1
+        if self.frame_count % 2 == 0:
+            try:
+                msg = CompressedImage()
+                msg.header = self.latest_header if self.latest_header is not None else Header()
+                msg.format = 'jpeg'
+                msg.data = np.array(cv2.imencode('.jpg', frame)[1]).tobytes()
+                self.image_pub.publish(msg)
+            except Exception as e:
+                self.get_logger().error(f'Error publicando imagen: {e}')
 
 
     # ── Odometría ─────────────────────────────────────────────────────────
@@ -311,7 +318,9 @@ class centerQR(Node):
     # ── Control ───────────────────────────────────────────────────────────
 
     def control(self):
-        self.process_qr()
+        if self.new_frame:          # ← solo procesar si hay frame nuevo
+            self.process_qr()
+            self.new_frame = False
 
         # Publicar detección siempre
         det_msg = Bool()
