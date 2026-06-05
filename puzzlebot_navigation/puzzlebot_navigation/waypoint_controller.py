@@ -25,6 +25,8 @@ from nav_msgs.msg import Path, Odometry
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from geometry_msgs.msg import Twist
 from std_msgs.msg import Bool, String
+from visualization_msgs.msg import MarkerArray, Marker
+from std_msgs.msg import ColorRGBA
 from tf_transformations import euler_from_quaternion
 
 import math
@@ -44,8 +46,8 @@ V_MAX     = 0.15    # m/s
 OMEGA_MAX = 0.15    # rad/s
 
 # Tolerancias
-GOAL_DIST_TOL  = 0.12   # m — radio para considerar waypoint alcanzado
-ANGLE_PRIORITY = math.radians(5)  # rad (~5°) — umbral para activar movimiento lineal
+GOAL_DIST_TOL  = 0.05   # m — radio para considerar waypoint alcanzado
+ANGLE_PRIORITY = math.radians(3)  # rad (~3°) — umbral para activar movimiento lineal
 
     
 # ═══════════════════════════════════════════════════════════════════════
@@ -76,6 +78,7 @@ class WaypointControllerNode(Node):
         # ── Publishers ────────────────────────────────────────────────
         self.cmd_vel_pub  = self.create_publisher(Twist, '/cmd_vel', 10)
         self.status_pub   = self.create_publisher(String, '/nav/status', 10)
+        self.markers_pub = self.create_publisher(MarkerArray, '/nav/waypoints_viz', 10)
 
         # ── Subscribers ───────────────────────────────────────────────
         self.cancel_sub = self.create_subscription(Bool, '/nav/cancel', self._cancel_cb, 10)
@@ -200,6 +203,9 @@ class WaypointControllerNode(Node):
         
         self.status_pub.publish(status)
 
+        if self.waypoints:
+            self._publish_waypoint_markers()
+
         cmd = Twist()
 
         # Ceder el control si Bug2 está activo
@@ -233,10 +239,10 @@ class WaypointControllerNode(Node):
             cmd = self._go_to_goal(dist_to_goal, error_theta, dt)
 
         self.cmd_vel_pub.publish(cmd)
-        self.get_logger().info(
-            f'[{self.state}] wp {self.wp_idx} | '
-            f'ed={dist_to_goal:.3f}m eθ={math.degrees(error_theta):.1f}° | '
-            f'v={cmd.linear.x:+.3f} w={cmd.angular.z:+.3f}')
+        #self.get_logger().info(
+        #    f'[{self.state}] wp {self.wp_idx} | '
+        #    f'ed={dist_to_goal:.3f}m eθ={math.degrees(error_theta):.1f}° | '
+        #    f'v={cmd.linear.x:+.3f} w={cmd.angular.z:+.3f}')
 
     # ─────────────────────────────────────────────────────────────────
     #  ESTADOS
@@ -289,6 +295,49 @@ class WaypointControllerNode(Node):
         cmd.linear.x  = u_v
         cmd.angular.z = u_w
         return cmd
+    
+    def _publish_waypoint_markers(self):
+        ma = MarkerArray()
+        stamp = self.get_clock().now().to_msg()
+
+        for i, (wx, wy) in enumerate(self.waypoints):
+            m = Marker()
+            m.header.stamp = stamp
+            m.header.frame_id = 'odom'
+            m.ns = 'waypoints'
+            m.id = i
+            m.type = Marker.SPHERE
+            m.action = Marker.ADD
+            m.pose.position.x = wx
+            m.pose.position.y = wy
+            m.pose.position.z = 0.05
+            m.pose.orientation.w = 1.0
+            m.scale.x = m.scale.y = m.scale.z = 0.08
+
+            if i < self.wp_idx:
+                # Ya visitados — gris
+                m.color = ColorRGBA(r=0.4, g=0.4, b=0.4, a=0.5)
+            elif i == self.wp_idx:
+                # Waypoint activo — verde brillante, más grande
+                m.color = ColorRGBA(r=0.2, g=1.0, b=0.2, a=1.0)
+                m.scale.x = m.scale.y = m.scale.z = 0.15
+            else:
+                # Pendientes — azul
+                m.color = ColorRGBA(r=0.3, g=0.6, b=1.0, a=0.8)
+
+            ma.markers.append(m)
+
+        # Borrar markers sobrantes de planes anteriores más largos
+        for i in range(len(self.waypoints), len(self.waypoints) + 20):
+            d = Marker()
+            d.header.stamp = stamp
+            d.header.frame_id = 'odom'
+            d.ns = 'waypoints'
+            d.id = i
+            d.action = Marker.DELETE
+            ma.markers.append(d)
+
+        self.markers_pub.publish(ma)
 
 
 # ═══════════════════════════════════════════════════════════════════════
