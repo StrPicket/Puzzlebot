@@ -74,8 +74,8 @@ from collections import defaultdict
 #  CONFIGURACIÓN
 # ═══════════════════════════════════════════════════════════════════════
 
-SEMANTIC_MAP_PATH = "/home/strpicket/semantic_map.png"
-ROUTE_MAP_PATH    = "/home/strpicket/route_map.png"
+SEMANTIC_MAP_PATH = "/home/juanjo/semantic_map.png"
+ROUTE_MAP_PATH    = "/home/juanjo/route_map.png"
 MAP_RESOLUTION    = 0.05        # m/pixel
 
 # Radio en píxeles para considerar que el robot "está sobre" una ruta
@@ -86,6 +86,8 @@ PATH_SUBSAMPLE    = 2
 
 # Submuestreo del path de ruta (reduce waypoints intermedios en líneas rectas)
 ROUTE_SUBSAMPLE   = 6
+
+MIN_START_DIST_M = 0.30  # m — ignorar waypoints demasiado cerca del inicio
 
 # Nombres de zona reconocidos
 ZONE_NAMES = ("carga", "descarga", "racks")
@@ -425,6 +427,7 @@ class SemanticPlannerNode(Node):
         self.path_msg  = None
         self.goal_desc = None
         self.kf_pose_active = False
+        self.mission_status = None
 
         # ── ROS ───────────────────────────────────────────────────────
         self.plan_pub = self.create_publisher(Path, '/plan', 10)
@@ -443,6 +446,9 @@ class SemanticPlannerNode(Node):
 
         self.status_sub = self.create_subscription(
             String, '/nav/status', self._status_callback, 10)
+        
+        self.mission_status_sub = self.create_subscription(
+            String, '/mission/status', self._mission_status_cb, 10) 
 
         self.goal_sub = self.create_subscription(
             String, '/goal_input', self._goal_input_cb, 10)
@@ -517,6 +523,16 @@ class SemanticPlannerNode(Node):
                 part = part.strip()
                 if part.startswith('wp='):
                     self.current_wp_idx = int(part.split('=')[1].split('/')[0])
+                    break
+        except Exception:
+            pass
+
+    def _mission_status_cb(self, msg: String):
+        try:
+            for part in msg.data.split('|'):
+                part = part.strip()
+                if part.startswith('state='):
+                    self.mission_status = part.split('=')[1].strip()
                     break
         except Exception:
             pass
@@ -666,13 +682,20 @@ class SemanticPlannerNode(Node):
 
         # ── Construir nav_msgs/Path ───────────────────────────────────
         msg = Path()
-        msg.header.frame_id = 'odom'
+        msg.header.frame_id = 'map'
         msg.header.stamp    = self.get_clock().now().to_msg()
 
+        min_dist_px = MIN_START_DIST_M / MAP_RESOLUTION  # metros → píxeles
+        start_px_ref = self.conv.odom_to_pixel(self.robot_ox, self.robot_oy)
+
         for px, py in full_path:
+            dist_to_start = math.hypot(px - start_px_ref[0], py - start_px_ref[1])
+            if dist_to_start < min_dist_px:
+                continue
+
             ox, oy = self.conv.pixel_to_odom(px, py)
             pose = PoseStamped()
-            pose.header.frame_id = 'odom'
+            pose.header.frame_id = 'map'
             pose.header.stamp    = msg.header.stamp
             pose.pose.position.x = ox
             pose.pose.position.y = oy
@@ -691,10 +714,11 @@ class SemanticPlannerNode(Node):
     # ─────────────────────────────────────────────────────────────────
 
     def _publish_plan(self):
-        if self.path_msg is None:
-            return
-        self.path_msg.header.stamp = self.get_clock().now().to_msg()
-        self.plan_pub.publish(self.path_msg)
+        if self.mission_status in ('NAVIGATE_TO_ZONE', 'NAVIGATE_TO_TRUCK'):
+            if self.path_msg is None:
+                return
+            self.path_msg.header.stamp = self.get_clock().now().to_msg()
+            self.plan_pub.publish(self.path_msg)
 
     # ─────────────────────────────────────────────────────────────────
     #  SERVICIO /replan
