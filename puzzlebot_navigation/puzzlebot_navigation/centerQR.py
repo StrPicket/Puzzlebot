@@ -29,8 +29,8 @@ DIST_COEFFS = np.array(
 )
 
 # Lado físico del QR en metros — ajusta según tu código impreso
-QR_W = 0.0865
-QR_H = 0.0775
+QR_W = 0.09
+QR_H = 0.09
 
 class centerQR(Node):
     def __init__(self):
