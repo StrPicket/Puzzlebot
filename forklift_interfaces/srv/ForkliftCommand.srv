@@ -1,0 +1,6 @@
+uint8 cmd
+uint8 speed
+float32 duration
+---
+bool success
+string message

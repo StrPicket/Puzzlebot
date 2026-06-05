@@ -57,6 +57,7 @@ KF_Q_THETA = 0.001
 KF_R_XY    = 0.1
 KF_R_THETA = 0.1
 
+MAX_ARUCO_DIST = 1.5
 aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
 try:
     det_params = aruco.DetectorParameters()
@@ -606,6 +607,9 @@ class ArucoPoseNode(Node):
 
                     if result is not None:
                         rx, ry, rth, dist_h, _, view_angle = result
+                        if dist_h > MAX_ARUCO_DIST:
+                            continue
+
                         perspective_penalty = 1.0 + (view_angle / 45.0) ** 2
 
                         quality = (
@@ -793,11 +797,12 @@ class ArucoPoseNode(Node):
         msg_c = PoseWithCovarianceStamped()
         msg_c.header.stamp    = stamp
         msg_c.header.frame_id = 'map'
-        msg_c.pose.pose.position.x    = - (kf_x - self.MAP_OFFSET_X)
-        msg_c.pose.pose.position.y    = - (kf_y - self.MAP_OFFSET_Y)
-        #msg_c.pose.pose.position.x    = 0.0 #kf_x - self.MAP_OFFSET_X
+        msg_c.pose.pose.position.x    = -(kf_x - self.MAP_OFFSET_X)
+        msg_c.pose.pose.position.y    = -(kf_y - self.MAP_OFFSET_Y)
+        #msg_c.pose.pose.position.x    = 0.0 #kf_x - self.MAP_OFFSET_X_
         #msg_c.pose.pose.position.y    = 0.0 #kf_y - self.MAP_OFFSET_Y
 
+        #theta_pub = kf_theta
         theta_pub = wrap_angle(kf_theta + math.pi)
         
         msg_c.pose.pose.orientation.z = math.sin(theta_pub / 2)
