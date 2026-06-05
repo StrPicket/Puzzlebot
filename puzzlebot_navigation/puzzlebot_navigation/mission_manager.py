@@ -81,7 +81,7 @@ import math
 # ═══════════════════════════════════════════════════════════════════════
 
 SEMANTIC_MAP_PATH = "/home/juanjo/semantic_map.png"
-ROUTE_MAP_PATH    = "/home/juanjo/route_map.png"
+ROUTE_MAP_PATH    = "/home/juanjo/waypoint_map.png"
 MAP_RESOLUTION    = 0.05   # m/pixel — debe coincidir con semantic_planner
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -95,10 +95,10 @@ SEARCH_WP_SUBSAMPLE = 8
 SEARCH_WP_MIN_DIST = 0.20
 
 # Radio para considerar que el robot ya está en la zona objetivo (m)
-ZONE_ARRIVAL_RADIUS = 0.20
+ZONE_ARRIVAL_RADIUS = 0.07
 
 # Tolerancia de ángulo para considerar que el giro de escaneo terminó (rad)
-SCAN_ANGLE_TOL = math.radians(5)
+SCAN_ANGLE_TOL = math.radians(3)
 
 # Segundos de espera mirando en cada dirección durante el escaneo
 SCAN_WAIT_S = 3.0
