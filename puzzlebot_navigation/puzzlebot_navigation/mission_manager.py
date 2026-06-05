@@ -5,8 +5,8 @@ mission_manager.py
 Nodo maestro — Orquestador de misiones del Puzzlebot
 
 Misiones disponibles:
-  mision_1 → carga   → encontrar QR → ir a descarga
-  mision_2 → racks   → encontrar QR → ir a descarga
+  mission_1 → carga   → encontrar QR → ir a descarga
+  mission_2 → racks   → encontrar QR → ir a descarga
 
 Máquina de estados:
   IDLE
@@ -25,17 +25,25 @@ Máquina de estados:
     └─ habilita /center_qr/enable = True
     └─ espera a que center_qr termine (ratio >= stop_ratio, 
        se detecta por /qr/detected = False tras alineación)
-    └─ termina → NAVIGATE_TO_DESCARGA
+    └─ termina → NAVIGATE_TO_TRUCK
 
-  NAVIGATE_TO_DESCARGA
+  LIFT_PALLET
+    └─ espera a que se complete (se detecta por /lift_pallet/status = DONE)
+    └─ termina → NAVIGATE_TO_TRUCK
+
+  NAVIGATE_TO_TRUCK
     └─ publica /goal_input = "descarga"
-    └─ llega → DONE
+    └─ llega → DROP_PALLET
+
+  DROP_PALLET
+    └─ espera a que se complete (se detecta por /drop_pallet/status = DONE)
+    └─ termina → DONE
 
   DONE
     └─ espera nueva misión
 
 Tópicos suscritos:
-  /mission            — std_msgs/String   ("mision_1" | "mision_2")
+  /mission            — std_msgs/String   ("mission_1" | "mission_2")
   /nav/status         — std_msgs/String   (estado waypoint_controller)
   /qr/detected        — std_msgs/Bool     (QR visible en cámara)
   /aruco/pose_centered — geometry_msgs/PoseWithCovarianceStamped (pose robot)
@@ -55,10 +63,9 @@ from rclpy import qos
 from std_msgs.msg import String, Bool
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
-from sensor_msgs.msg import CompressedImage, Image
+from sensor_msgs.msg import CompressedImage
 
 import cv2
-from cv_bridge import CvBridge
 import numpy as np
 import math
 
@@ -66,8 +73,8 @@ import math
 #  CONFIGURACIÓN
 # ═══════════════════════════════════════════════════════════════════════
 
-SEMANTIC_MAP_PATH = "/home/strpicket/semantic_map.png"
-ROUTE_MAP_PATH    = "/home/strpicket/route_map.png"
+SEMANTIC_MAP_PATH = "/home/juanjo/semantic_map.png"
+ROUTE_MAP_PATH    = "/home/juanjo/route_map.png"
 MAP_RESOLUTION    = 0.05   # m/pixel — debe coincidir con semantic_planner
 
 # Submuestreo de waypoints de búsqueda (cada N píxeles de ruta)
@@ -204,8 +211,8 @@ class MissionManagerNode(Node):
 
     # Mapeo misión → zona origen
     MISSION_MAP = {
-        'mision_1': 'carga',
-        'mision_2': 'racks',
+        'mission_1': 'carga',
+        'mission_2': 'racks',
     }
 
     def __init__(self):
@@ -239,24 +246,21 @@ class MissionManagerNode(Node):
 
         # ── Estado ────────────────────────────────────────────────────
         self.state          = 'IDLE'
-        self.current_mission = None     # 'mision_1' | 'mision_2'
+        self.current_mission = None     # 'mission_1' | 'mission_2'
         self.current_zone   = None      # 'carga' | 'racks'
 
         self.robot_x    = 0.0
         self.robot_y    = 0.0
+        self.robot_th   = 0.0
         self.pose_ok    = False
 
         self.nav_state       = 'WAIT_PLAN'   # último estado de waypoint_controller
+        self.forklift_state  = 'IDLE'
         self.qr_detected     = False
         self.qr_centered     = False
         self.qr_lost_count   = 0
 
-        self.latest_aruco_frame = None
-        self.latest_aruco_header = None
         self.latest_aruco_msg = None
-
-        self.latest_qr_frame = None
-        self.latest_qr_header = None
         self.latest_qr_msg = None
 
         self.state_start_time = self.get_clock().now()
@@ -267,7 +271,6 @@ class MissionManagerNode(Node):
         self.enable_pub  = self.create_publisher(Bool,   '/center_qr/enable', 10)
         self.cancel_pub  = self.create_publisher(Bool,   '/nav/cancel',      10)
         self.status_pub  = self.create_publisher(String, '/mission/status',  10)
-        self.img_pub     = self.create_publisher(Image, '/mission_manager_image', 10)
         self.img_pub_compressed = self.create_publisher(CompressedImage, '/mission_manager_image/compressed', 10)
 
         # ── Subscribers ───────────────────────────────────────────────
@@ -276,6 +279,9 @@ class MissionManagerNode(Node):
 
         self.status_sub = self.create_subscription(
             String, '/nav/status', self._nav_status_cb, 10)
+        
+        self.forklift_sub = self.create_subscription(
+            String, '/forklift/status', self._forklift_status_cb, 10)
 
         self.qr_sub = self.create_subscription(
             Bool, '/qr/detected', self._qr_detected_cb, 10)
@@ -301,7 +307,7 @@ class MissionManagerNode(Node):
         self.get_logger().info(
             'mission_manager listo\n'
             '  Envía misión con:\n'
-            '  ros2 topic pub --once /mission std_msgs/String "data: \'mision_1\'"')
+            '  ros2 topic pub --once /mission std_msgs/String "data: \'mission_1\'"')
 
     # ─────────────────────────────────────────────────────────────────
     #  CALLBACKS
@@ -309,27 +315,9 @@ class MissionManagerNode(Node):
 
     def aruco_cam_cb(self, msg: CompressedImage):
         self.latest_aruco_msg = msg
-        try:
-            np_arr = np.frombuffer(msg.data, np.uint8)
-            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-            self.latest_aruco_frame  = frame
-            self.latest_aruco_header = msg.header
-        except Exception as e:
-            self.get_logger().error(f'aruco_image_callback: {e}')
-            self.latest_aruco_frame  = None
-            self.latest_aruco_header = None
 
     def qr_cam_cb(self, msg: CompressedImage):
         self.latest_qr_msg = msg
-        try:
-            np_arr = np.frombuffer(msg.data, np.uint8)
-            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-            self.latest_qr_frame  = frame
-            self.latest_qr_header = msg.header
-        except Exception as e:
-            self.get_logger().error(f'qr_image_callback: {e}')
-            self.latest_qr_frame  = None
-            self.latest_qr_header = None
 
     def _mission_cb(self, msg: String):
         mission = msg.data.strip().lower()
@@ -357,6 +345,13 @@ class MissionManagerNode(Node):
             if part.startswith('state='):
                 self.nav_state = part.split('=')[1].strip()
                 break
+    
+    def _forklift_status_cb(self, msg: String):
+        for part in msg.data.split('|'):
+            part = part.strip()
+            if part.startswith('state='):
+                self.forklift_state = part.split('=')[1].strip()
+                break
 
     def _qr_detected_cb(self, msg: Bool):
         self.qr_detected = msg.data
@@ -369,8 +364,12 @@ class MissionManagerNode(Node):
         self.qr_centered = msg.data
 
     def _pose_cb(self, msg: PoseWithCovarianceStamped):
+        from tf_transformations import euler_from_quaternion
         self.robot_x = msg.pose.pose.position.x
         self.robot_y = msg.pose.pose.position.y
+        q = msg.pose.pose.orientation
+        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        self.robot_th = yaw
         self.pose_ok = True
 
     # ─────────────────────────────────────────────────────────────────
@@ -379,6 +378,7 @@ class MissionManagerNode(Node):
 
     def _fsm_step(self):
         self._publish_status()
+        self._publish_current_image()
 
         if self.state == 'IDLE':
             pass   # espera misión
@@ -392,8 +392,14 @@ class MissionManagerNode(Node):
         elif self.state == 'CENTER_QR':
             self._step_center_qr()
 
-        elif self.state == 'NAVIGATE_TO_DESCARGA':
-            self._step_navigate_to_descarga()
+        elif self.state == 'LIFT_PALLET':
+            self._step_lift_pallet()
+
+        elif self.state == 'NAVIGATE_TO_TRUCK':
+            self._step_navigate_to_truck()
+
+        elif self.state == 'DROP_PALLET':
+            self._step_drop_pallet()
 
         elif self.state == 'DONE':
             pass   # espera nueva misión
@@ -467,15 +473,28 @@ class MissionManagerNode(Node):
             self._transition('SEARCH_QR')
             return
 
-        if self.qr_detected and self.qr_centered:
+        if self.qr_centered:
             self.get_logger().info(
-                'Alineación completada (timeout seguro) → NAVIGATE_TO_DESCARGA')
+                'Alineación completada → NAVIGATE_TO_TRUCK')
             self._disable_center_qr()
-            self._transition('NAVIGATE_TO_DESCARGA')
+            self._transition('LIFT_PALLET')
 
-    # ── NAVIGATE_TO_DESCARGA ──────────────────────────────────────────
+    # ── LIFT_PALLET ────────────────────────────────────────────────
 
-    def _step_navigate_to_descarga(self):
+    def _step_lift_pallet(self):
+        elapsed = self._elapsed()
+
+        if elapsed < 0.15:
+            self.get_logger().info('Levantando pallet')
+            return
+        
+        if self.forklift_state == 'DONE':
+            self.get_logger().info('Pallet levantado → NAVIGATE_TO_TRUCK')
+            self._transition('NAVIGATE_TO_TRUCK')        
+
+    # ── NAVIGATE_TO_TRUCK ──────────────────────────────────────────
+
+    def _step_navigate_to_truck(self):
         elapsed = self._elapsed()
 
         if elapsed < 0.15:
@@ -486,8 +505,21 @@ class MissionManagerNode(Node):
             return
 
         if self.nav_state == 'DONE':
-            self.get_logger().info('Llegó a descarga → DONE')
-            self._transition('DONE')
+            self.get_logger().info('Llegó a descarga → DROP_PALLET')
+            self._transition('DROP_PALLET')
+
+    # ── LIFT_PALLET ────────────────────────────────────────────────
+
+    def _step_drop_pallet(self):
+        elapsed = self._elapsed()
+
+        if elapsed < 0.15:
+            self.get_logger().info('Dejando pallet')
+            return
+        
+        if self.forklift_state == 'DONE':
+            self.get_logger().info('Pallet entregado → DONE')
+            self._transition('DONE') 
 
     # ─────────────────────────────────────────────────────────────────
     #  HELPERS
@@ -498,6 +530,8 @@ class MissionManagerNode(Node):
         self.state = new_state
         self.state_start_time = self.get_clock().now()
         self.nav_state    = 'WAIT_PLAN'   # reset para no disparar condiciones viejas
+        if new_state in ('LIFT_PALLET', 'DROP_PALLET'):
+            self.forklift_state = 'IDLE'
         self.qr_lost_count = 0
 
     def _elapsed(self) -> float:
@@ -561,33 +595,12 @@ class MissionManagerNode(Node):
         
     def _publish_current_image(self):
 
-        frame = None
-        header = None
-
         if self.state == 'CENTER_QR':
-            frame = self.latest_qr_frame
-            header = self.latest_qr_header
             if self.latest_qr_msg is not None:
                 self.img_pub_compressed.publish(self.latest_qr_msg)
         else:
-            frame = self.latest_aruco_frame
-            header = self.latest_aruco_header
             if self.latest_aruco_msg is not None:
                 self.img_pub_compressed.publish(self.latest_aruco_msg)
-
-        if frame is None:
-            return
-
-        try:
-            img_msg = self.bridge.cv2_to_imgmsg(frame, encoding='bgr8')
-
-            if header is not None:
-                img_msg.header = header
-
-            self.img_pub.publish(img_msg)
-
-        except Exception as e:
-            self.get_logger().error(f'Error publicando imagen: {e}')
 
     def _publish_status(self):
         msg = String()
@@ -597,7 +610,7 @@ class MissionManagerNode(Node):
             f'zone={self.current_zone} | '
             f'qr={self.qr_detected} | '
             f'nav={self.nav_state} | '
-            f'x={self.robot_x:.2f} y={self.robot_y:.2f}'
+            f'x={self.robot_x:.2f} y={self.robot_y:.2f} th={math.degrees(self.robot_th):.2f} | '
         )
         
         self.status_pub.publish(msg)
