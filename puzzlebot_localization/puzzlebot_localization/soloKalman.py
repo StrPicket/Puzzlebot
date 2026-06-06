@@ -52,8 +52,9 @@ ARUCO_MAP = {
     8:  (3.590 + X_OFF, Y_OFF - 2.3795,  0.0),
     9:  (0.000 + X_OFF, Y_OFF - 0.3650,  0.0),
     10: (0.000 + X_OFF, Y_OFF - 2.8755,  0.0),
-} 
-
+    19: (1.940 + X_OFF, Y_OFF - 0.0000, -math.pi / 2),
+    31: (1.940 + X_OFF, Y_OFF - 3.6645,  math.pi / 2),
+}
 # robot real
 WHEEL_RADIUS = 0.0475
 WHEEL_BASE   = 0.19

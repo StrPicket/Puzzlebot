@@ -12,12 +12,12 @@ def generate_launch_description():
             output='screen',
         ),
 
-        # Node(
-        #     package='puzzlebot_navigation',
-        #     executable='waypoint_controller',
-        #     name='waypoint_controller',
-        #     output='screen',
-        # ),
+        Node(
+            package='puzzlebot_navigation',
+            executable='waypoint_controller',
+            name='waypoint_controller',
+            output='screen',
+        ),
 
         Node(
             package='puzzlebot_navigation',
@@ -33,12 +33,19 @@ def generate_launch_description():
             output='screen',
         ),
 
-        # Node(
-        #     package='puzzlebot_navigation',
-        #     executable='mission_manager',
-        #     name='mission_manager',
-        #     output='screen',
-        # ),
+        Node(
+            package='puzzlebot_navigation',
+            executable='mission_manager',
+            name='mission_manager',
+            output='screen',
+        ),
+
+        Node(
+            package='puzzlebot_navigation',
+            executable='centerQR',
+            name='centerQR',
+            output='screen',
+        ),
 
         Node(
             package='tf2_ros',

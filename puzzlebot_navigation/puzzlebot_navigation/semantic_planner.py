@@ -441,7 +441,7 @@ class SemanticPlannerNode(Node):
             PoseWithCovarianceStamped,'/aruco/pose_centered',
             self._kf_pose_callback,10)
         
-        self.REPLAN_DIST_THRESH = 0.40
+        self.REPLAN_DIST_THRESH = 1.0
 
         self.current_wp_idx = 0
 
@@ -502,10 +502,11 @@ class SemanticPlannerNode(Node):
         if not poses:
             return
 
-        # Distancia mínima a cualquier waypoint del plan
-        min_dist = min(
-            math.hypot(new_x - p.pose.position.x, new_y - p.pose.position.y)
-            for p in poses
+        """ wp_idx = min(self.current_wp_idx, len(poses) - 1)
+        active = poses[wp_idx]
+        min_dist = math.hypot(
+            new_x - active.pose.position.x,
+            new_y - active.pose.position.y
         )
 
         if min_dist > self.REPLAN_DIST_THRESH:
@@ -513,7 +514,7 @@ class SemanticPlannerNode(Node):
                 f'Corrección ArUco: {min_dist:.2f} m del plan → replaneando...')
             goal_px = self._parse_goal(self.goal_desc)
             if goal_px is not None:
-                self._plan(goal_px, description=self.goal_desc)
+                self._plan(goal_px, description=self.goal_desc) """
 
     # ─────────────────────────────────────────────────────────────────
     #  ENTRADA DE DESTINO

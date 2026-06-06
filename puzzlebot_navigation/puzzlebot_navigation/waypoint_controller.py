@@ -46,8 +46,8 @@ V_MAX     = 0.15    # m/s
 OMEGA_MAX = 0.15    # rad/s
 
 # Tolerancias
-GOAL_DIST_TOL  = 0.05   # m — radio para considerar waypoint alcanzado
-ANGLE_PRIORITY = math.radians(3)  # rad (~3°) — umbral para activar movimiento lineal
+GOAL_DIST_TOL  = 0.1   # m — radio para considerar waypoint alcanzado
+ANGLE_PRIORITY = math.radians(5)  # rad (~3°) — umbral para activar movimiento lineal
 
     
 # ═══════════════════════════════════════════════════════════════════════

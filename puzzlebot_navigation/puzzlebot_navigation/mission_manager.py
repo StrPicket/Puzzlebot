@@ -82,7 +82,7 @@ import math
 # ═══════════════════════════════════════════════════════════════════════
 
 SEMANTIC_MAP_PATH = "/home/strpicket/semantic_map.png"
-ROUTE_MAP_PATH    = "/home/strpicket/waypoint_map.png"
+ROUTE_MAP_PATH    = "/home/strpicket/waypoint.png"
 MAP_RESOLUTION    = 0.05   # m/pixel — debe coincidir con semantic_planner
 
 # ═══════════════════════════════════════════════════════════════════════

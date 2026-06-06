@@ -98,8 +98,8 @@ class MapPublisherNode(Node):
         msg.info.origin.position.z    = 0.0
         msg.info.origin.orientation.w = 1.0
 
-        #grid_flipped = np.flipud(grid)
-        grid_flipped = np.flipud(np.fliplr(grid))
+        grid_flipped = np.flipud(grid)
+        #grid_flipped = np.flipud(np.fliplr(grid))
         msg.data = grid_flipped.flatten().tolist()
 
         return msg
