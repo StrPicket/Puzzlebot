@@ -95,6 +95,9 @@ class WaypointControllerNode(Node):
         self.odom_sub = self.create_subscription(
             Odometry, '/odom', self._odom_callback,
             qos.qos_profile_sensor_data)
+        
+        self.mission_status_sub = self.create_subscription(
+            String, '/mission/status', self._mission_status_cb, 10)
 
         self.bug2_sub = self.create_subscription(
             Bool, '/bug2/active', self._bug2_callback, 10)
@@ -113,6 +116,8 @@ class WaypointControllerNode(Node):
         self.y_start     = 0.0
 
         self.bug2_active = False   # True = Bug2 tiene el control
+        self.mission_status = None
+        self.mission_sub_status = None
 
         self.state = 'WAIT_PLAN'
 
@@ -125,6 +130,14 @@ class WaypointControllerNode(Node):
     # ─────────────────────────────────────────────────────────────────
     #  CALLBACKS
     # ─────────────────────────────────────────────────────────────────
+
+    def _mission_status_cb(self, msg:String):
+        for part in msg.data.split('|'):
+            part = part.strip()
+            if part.startswith('state='):
+                self.mission_status = part.split('=')[1].strip()
+            elif part.startswith('sub='):
+                self.mission_sub_status = part.split('=')[1].strip()
 
     def _cancel_cb(self, msg: Bool):
         if msg.data:
@@ -188,6 +201,11 @@ class WaypointControllerNode(Node):
     #  LOOP DE CONTROL
     # ─────────────────────────────────────────────────────────────────
 
+    def _other_node_has_control(self) -> bool:
+        scanning    = self.mission_sub_status in ('SCAN_ROTATE_A', 'SCAN_ROTATE_B')
+        forklift_op = self.mission_status in ('CENTER_QR', 'LIFT_PALLET', 'DROP_PALLET')
+        return scanning or forklift_op
+
     def _control_loop(self):
         now = self.get_clock().now()
         dt  = clamp((now - self.last_time).nanoseconds * 1e-9, 1e-4, 0.1)
@@ -203,6 +221,9 @@ class WaypointControllerNode(Node):
         
         self.status_pub.publish(status)
 
+        if self._other_node_has_control():
+            return
+
         if self.waypoints:
             self._publish_waypoint_markers()
 
@@ -213,11 +234,7 @@ class WaypointControllerNode(Node):
             self.cmd_vel_pub.publish(cmd)
             return
 
-        if self.state == 'WAIT_PLAN':
-            self.cmd_vel_pub.publish(cmd)
-            return
-
-        if self.state == 'DONE':
+        if self.state in ('WAIT_PLAN', 'DONE'):
             self.cmd_vel_pub.publish(cmd)
             return
 
