@@ -24,12 +24,12 @@ setup(
     },
     entry_points={
         'console_scripts': [    
-            'centerQR           = puzzlebot_navigation.centerQR:main',
-            'waypoints           = puzzlebot_navigation.waypoints:main',
-            'semantic_planner    = puzzlebot_navigation.semantic_planner:main',
             'bug2_monitor        = puzzlebot_navigation.bug2_monitor:main',
-            'waypoint_controller = puzzlebot_navigation.waypoint_controller:main',
+            'centerQR            = puzzlebot_navigation.centerQR:main',
+            'forklift_rutine     = puzzlebot_navigation.forklift_routine:main',
             'mission_manager     = puzzlebot_navigation.mission_manager:main',
+            'semantic_planner    = puzzlebot_navigation.semantic_planner:main',
+            'waypoint_controller = puzzlebot_navigation.waypoint_controller:main',
         ],
     },
 )

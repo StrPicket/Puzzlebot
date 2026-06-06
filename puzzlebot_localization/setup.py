@@ -24,11 +24,12 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'pose_estimation  = puzzlebot_localization.poseEstimation:main',
-            'pose_kalman      = puzzlebot_localization.poseKalman:main',
-            'particle_filter  = puzzlebot_localization.particle_filter:main',
             'monte_carlo      = puzzlebot_localization.monteCarlo:main',
-            'centerQR         = puzzlebot_localization.centerQR:main',
+            'odometry         = puzzlebot_localization.odometry:main',
+            'particle_filter  = puzzlebot_localization.particle_filter:main',
+            'pose_estimation  = puzzlebot_localization.poseEstimation:main',
+            'soloArucos       = puzzlebot_localization.soloArucos:main',
+            'soloKalman       = puzzlebot_localization.soloKalman:main',
         ],
     },
 )
