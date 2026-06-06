@@ -6,7 +6,7 @@ Rutina para el manejo del forklift del Puzzlebot
 
 Mission 1 (zona de carga):
     - Pre-elevar horquillas vacías a altura del pallet
-    - Avanzar reaching_dist (0.5 m) para meter horquillas
+    - Avanzar reaching_dist (0.3 m) para meter horquillas
     - Levantar pallet (LIFTING)
     - Retroceder reaching_dist (LEAVING)
     --------------------------------------------------
@@ -16,7 +16,7 @@ Mission 1 (zona de carga):
 
 Mission 2 (zona de racks):
     - Pre-elevar horquillas vacías a altura del pallet
-    - Avanzar reaching_dist (0.3 m) para meter horquillas
+    - Avanzar reaching_dist (0.2 m) para meter horquillas
     - Levantar pallet (LIFTING)
     - Retroceder reaching_dist (LEAVING)
     --------------------------------------------------
@@ -75,8 +75,8 @@ class ForkliftRutine(Node):
         self.w_robot = 0.0
         self.v_robot = 0.0
 
-        self.radio  = 0.0505
-        self.lenght = 0.183
+        self.radio  = 0.0475
+        self.lenght = 0.19
 
         # ── Parámetros de distancia ──────────────────────────────
         # reaching_dist : distancia a avanzar para meter horquillas
@@ -84,7 +84,7 @@ class ForkliftRutine(Node):
         # entering_dist : distancia al truck — igual para ambas misiones
         self.waypoint_dist  = 0.0
         self.reaching_dist  = 0.0
-        self.entering_dist  = 1.5   # m — distancia de entrada al truck
+        self.entering_dist  = 0.2   # m — distancia de entrada al truck
 
         # ── Comandos de forklift ─────────────────────────────────
         # forklift_pre_cmd  : altura para meter horquillas vacías (REACHING)
@@ -95,14 +95,13 @@ class ForkliftRutine(Node):
         self.forklift_lift_cmd = None
         self.forklift_drop_cmd = None
 
-        # ── Ganancias control lineal (PI) ────────────────────────
-        self.Kp_v        = 0.15
-        self.Ki_v        = 0.25
-        self.int_error_l = 0.0
+        # ── Ganancias control lineal (PV) ────────────────────────
+        self.Kp_v        = 0.20
+        self.Kv_v        = 0.05
 
         # ── Ganancias control angular (P + amortiguación) ────────
-        self.Kp_w = 0.08
-        self.Kv_w = 0.05
+        self.Kp_w = 0.15
+        self.Kv_w = 0.02
 
         # ── Estado de la misión (recibido por tópico) ─────────────
         self.current_mission       = None   # 'mission_1' | 'mission_2'
@@ -165,7 +164,6 @@ class ForkliftRutine(Node):
         self.x           = 0.0
         self.y           = 0.0
         self.theta       = 0.0
-        self.int_error_l = 0.0
 
     def odometria(self):
         current_time = self.get_clock().now()
@@ -175,13 +173,13 @@ class ForkliftRutine(Node):
         if dt <= 0:
             return
 
-        v_r   = self.radio * self.wr.data
-        v_l   = self.radio * self.wl.data
+        v_r   = - self.radio * self.wr.data
+        v_l   = - self.radio * self.wl.data
         V_avg = (v_r + v_l) / 2.0
         W     = (v_r - v_l) / self.lenght
 
-        self.v_robot = 0.15 * self.v_robot + 0.85 * V_avg
-        self.w_robot = 0.15 * self.w_robot + 0.85 * W
+        self.v_robot = V_avg
+        self.w_robot = W
 
         self.x     += V_avg * math.cos(self.theta) * dt
         self.y     += V_avg * math.sin(self.theta) * dt
@@ -206,22 +204,35 @@ class ForkliftRutine(Node):
         self.last_time_control = current_time
         dt = min(dt, 0.1)
 
-        if self.current_state in ('REACHING', 'LEAVING'):
-            error_x     = self.waypoint_dist - self.x
-            error_theta = -self.theta   # mantener recto (theta=0)
+        if self.current_state in ('REACHING', 'LEAVING') and abs(self.waypoint_dist) > 0.001:
 
-            if abs(error_x) < 0.05:
-                # Waypoint alcanzado — señalar a _fsm_step y limpiar
+            target_dist = abs(self.waypoint_dist)
+            traveled    = abs(self.x)
+            error_x     = target_dist - traveled
+            error_theta = -self.theta
+
+            if error_x < 0.15:
+                self.cmd_vel_pub.publish(Twist())  # frenar inmediato
                 self._reset_odom()
                 self.waypoint_dist    = 0.0
                 self.waypoint_reached = True
-            else:
-                self.int_error_l += error_x * dt
-                v_cmd = self.Ki_v * self.int_error_l - self.Kp_v * self.x
-                w_cmd = self.Kp_w * error_theta - self.Kv_w * self.w_robot
+                return
 
-                cmd.linear.x  = max(min(v_cmd, 0.20), -0.20)
-                cmd.angular.z = max(min(w_cmd, 0.20), -0.20)
+            v_cmd = self.Kp_v * error_x - self.Kv_v * abs(self.v_robot)
+            v_cmd = max(min(v_cmd, 0.1), 0.0)
+
+            w_cmd = self.Kp_w * error_theta - self.Kv_w * self.w_robot
+            w_cmd = max(min(w_cmd, 0.04), -0.04)
+
+            # En tu robot:
+            # cmd negativo = avanzar
+            # cmd positivo = retroceder
+            if self.current_state == 'REACHING':
+                cmd.linear.x = v_cmd
+            elif self.current_state == 'LEAVING':
+                cmd.linear.x = - v_cmd
+
+            cmd.angular.z = w_cmd
 
         # En LIFTING, DROPPING, IDLE, DONE: robot quieto
         self.cmd_vel_pub.publish(cmd)
@@ -237,11 +248,11 @@ class ForkliftRutine(Node):
         if self.current_mission_state == 'LIFT_PALLET':
             if self.current_mission == 'mission_1':
                 # Zona de carga: pallet en conveyor
-                self.reaching_dist    = 0.5   # m — distancia a meter horquillas
+                self.reaching_dist    = 0.3  # m — distancia a meter horquillas
                 self.forklift_pre_cmd = {
                     "cmd": 1,
                     "speed": 255,
-                    "duration": 1.30
+                    "duration": 1.2
                 }
                 self.forklift_lift_cmd = {
                     "cmd": 1,
@@ -254,7 +265,7 @@ class ForkliftRutine(Node):
                 self.forklift_pre_cmd = {
                     "cmd": 1,
                     "speed": 255,
-                    "duration": 0.5
+                    "duration": 0.7
                 }
                 self.forklift_lift_cmd = {
                     "cmd": 1,
@@ -329,7 +340,7 @@ class ForkliftRutine(Node):
                     self.command_sent = True
 
                 # 2. Esperar 2 s a que el forklift suba antes de avanzar
-                if self._elapsed() > 2.0 and self.waypoint_dist == 0.0:
+                if self._elapsed() > 2.0 and abs(self.waypoint_dist) < 0.001:
                     self.waypoint_dist = self.reaching_dist
                     self.get_logger().info(
                         f'[REACHING] Forklift listo — avanzando {self.reaching_dist:.2f}m')
@@ -407,16 +418,22 @@ class ForkliftRutine(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = ForkliftRutine()
+
     try:
         rclpy.spin(node)
+
     except KeyboardInterrupt:
-        pass
+        node.get_logger().info('Ctrl+C recibido — frenando y cerrando nodo')
+
     finally:
-        node.cmd_vel_pub.publish(Twist())   # frenar al salir
+        # Frenar ANTES de destruir nodo o cerrar rclpy
+        try:
+            if rclpy.ok():
+                node.cmd_vel_pub.publish(Twist())
+        except Exception as e:
+            node.get_logger().warn(f'No se pudo publicar stop al salir: {e}')
+
         node.destroy_node()
+
         if rclpy.ok():
             rclpy.shutdown()
-
-
-if __name__ == '__main__':
-    main()
