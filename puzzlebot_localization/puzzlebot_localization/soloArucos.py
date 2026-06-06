@@ -43,7 +43,7 @@ CAMERA_MATRIX = np.array([
 DIST_COEFFS = np.array([[0.00383057, 0.1087906, -1.68623574, 3.76464743]], dtype=np.float64)
 
 ARUCO_DICT = cv2.aruco.DICT_4X4_50
-VALID_IDS  = set(range(0, 11))
+VALID_IDS  = set(range(0, 11)) | {19, 31}
 
 
 class ArucoDetector(Node):
