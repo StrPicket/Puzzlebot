@@ -74,8 +74,8 @@ from collections import defaultdict
 #  CONFIGURACIÓN
 # ═══════════════════════════════════════════════════════════════════════
 
-SEMANTIC_MAP_PATH = "/home/strpicket/semantic_map.png"
-ROUTE_MAP_PATH    = "/home/strpicket/route_map.png"
+SEMANTIC_MAP_PATH = "/home/juanjo/semantic_map.png"
+ROUTE_MAP_PATH    = "/home/juanjo/route_map.png"
 MAP_RESOLUTION    = 0.05        # m/pixel
 
 # Radio en píxeles para considerar que el robot "está sobre" una ruta
@@ -428,6 +428,7 @@ class SemanticPlannerNode(Node):
         self.goal_desc = None
         self.kf_pose_active = False
         self.mission_status = None
+        self.nav_status     = 'WAIT_PLAN'  # estado del waypoint_controller
 
         # ── ROS ───────────────────────────────────────────────────────
         self.plan_pub = self.create_publisher(Path, '/plan', 10)
@@ -491,27 +492,28 @@ class SemanticPlannerNode(Node):
         if not self.odom_ok:
             self.odom_ok = True
 
-        # En lugar de comparar contra plan_origin, comparar contra el waypoint activo
+        # Replanear solo si el robot se desvió de TODOS los waypoints del plan
+        # (no solo del activo). Esto evita replanning innecesario durante
+        # navegación normal donde el robot se aleja del wp anterior al avanzar.
         if self.path_msg is None or self.goal_desc is None:
             return
 
         poses = self.path_msg.poses
-        if not poses or self.current_wp_idx >= len(poses):
+        if not poses:
             return
 
-        # Posición del waypoint que debería estar siguiendo ahora
-        wp = poses[self.current_wp_idx]
-        dist_to_current_wp = math.hypot(
-            new_x - wp.pose.position.x,
-            new_y - wp.pose.position.y
+        # Distancia mínima a cualquier waypoint del plan
+        min_dist = min(
+            math.hypot(new_x - p.pose.position.x, new_y - p.pose.position.y)
+            for p in poses
         )
 
-        if dist_to_current_wp > self.REPLAN_DIST_THRESH:
+        if min_dist > self.REPLAN_DIST_THRESH:
             self.get_logger().info(
-                f'Corrección ArUco: {dist_to_current_wp:.2f} m del wp activo → replaneando...')
+                f'Corrección ArUco: {min_dist:.2f} m del plan → replaneando...')
             goal_px = self._parse_goal(self.goal_desc)
             if goal_px is not None:
-                self._run_astar(goal_px, description=self.goal_desc)
+                self._plan(goal_px, description=self.goal_desc)
 
     # ─────────────────────────────────────────────────────────────────
     #  ENTRADA DE DESTINO
@@ -523,7 +525,8 @@ class SemanticPlannerNode(Node):
                 part = part.strip()
                 if part.startswith('wp='):
                     self.current_wp_idx = int(part.split('=')[1].split('/')[0])
-                    break
+                elif part.startswith('state='):
+                    self.nav_status = part.split('=')[1].strip()
         except Exception:
             pass
 
@@ -652,8 +655,11 @@ class SemanticPlannerNode(Node):
             if route_path is None:
                 log.error('  Fase 1: no se encontró camino en el grafo de rutas')
                 return
-            route_s = subsample_path(route_path, ROUTE_SUBSAMPLE)
-            log.info(f'    {len(route_path)} px de ruta → {len(route_s)} waypoints')
+            # smooth_direction elimina waypoints intermedios en líneas rectas
+            # dejando solo los puntos donde la ruta cambia de dirección.
+            # Esto evita paradas innecesarias cuando el robot ya está en la ruta.
+            route_s = smooth_direction(subsample_path(route_path, ROUTE_SUBSAMPLE))
+            log.info(f'    {len(route_path)} px de ruta → {len(route_s)} waypoints (tras smooth)')
             # Evitar duplicar el punto de entrada que ya puede estar en full_path
             if full_path and route_s and route_s[0] == full_path[-1]:
                 route_s = route_s[1:]
@@ -714,11 +720,17 @@ class SemanticPlannerNode(Node):
     # ─────────────────────────────────────────────────────────────────
 
     def _publish_plan(self):
-        if self.mission_status in ('NAVIGATE_TO_ZONE', 'NAVIGATE_TO_TRUCK'):
-            if self.path_msg is None:
-                return
-            self.path_msg.header.stamp = self.get_clock().now().to_msg()
-            self.plan_pub.publish(self.path_msg)
+        # Solo republica si el waypoint_controller aún no recibió el plan
+        # (nav_state sigue en WAIT_PLAN). Una vez que arrancó la navegación,
+        # no se vuelve a publicar para evitar resetear wp_idx.
+        if self.mission_status not in ('NAVIGATE_TO_ZONE', 'NAVIGATE_TO_TRUCK'):
+            return
+        if self.path_msg is None:
+            return
+        if self.nav_status != 'WAIT_PLAN':
+            return
+        self.path_msg.header.stamp = self.get_clock().now().to_msg()
+        self.plan_pub.publish(self.path_msg)
 
     # ─────────────────────────────────────────────────────────────────
     #  SERVICIO /replan
