@@ -28,6 +28,7 @@ setup(
             'pose_kalman      = puzzlebot_localization.poseKalman:main',
             'particle_filter  = puzzlebot_localization.particle_filter:main',
             'monte_carlo      = puzzlebot_localization.monteCarlo:main',
+            'centerQR         = puzzlebot_localization.centerQR:main',
         ],
     },
 )
