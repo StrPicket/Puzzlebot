@@ -39,7 +39,7 @@ BÚSQUEDA DE QR — ESQUEMA DE VISITADOS Y RUTAS
 
 Máquina de estados principal:
   IDLE → NAVIGATE_TO_ZONE → SEARCH_QR → CENTER_QR
-       → LIFT_PALLET → NAVIGATE_TO_TRUCK → DROP_PALLET → DONE
+       → LIFT_PALLET → NAVIGATE_TO_TRUCK → FIND_TRUCK → DROP_PALLET → DONE
 
 Sub-FSM dentro de SEARCH_QR:
   MOVE_TO_WP → SCAN_ROTATE_A → SCAN_WAIT_A
@@ -51,6 +51,8 @@ Tópicos suscritos:
   /nav/status           — std_msgs/String
   /qr/detected          — std_msgs/Bool
   /qr/centered          — std_msgs/Bool
+  /qr/mark_detected     — std_msgs/String
+  /yolo/mark_detected   — std_msgs/String
   /aruco/pose_centered  — geometry_msgs/PoseWithCovarianceStamped
   /forklift/status      — std_msgs/String
   /aruco/image_detected/compressed
@@ -97,8 +99,11 @@ SCAN_OMEGA           = 0.20   # rad/s máx durante giro de escaneo
 SCAN_KP_W            = 0.80
 QR_LOST_COUNT_THRESHOLD = 30
 MISSION1_SCAN_THETA  = 0.0
-MISSION2_SCAN_DELTA_A = math.pi / 2.0
-MISSION2_SCAN_DELTA_B = -math.pi
+
+# Ángulo global al que mira el robot al buscar el truck (180°)
+TRUCK_SCAN_THETA  = math.pi
+# Segundos de espera en cada waypoint durante FIND_TRUCK
+TRUCK_SCAN_WAIT_S = 3.0
 
 # Tolerancia RDP para simplificación de paths (píxeles).
 # 1.5 = muy fiel; 3.0 = muy reducido.  2.0 es un buen balance.
@@ -171,18 +176,25 @@ def build_route_masks(route_img: np.ndarray):
     mask_blue   = (b > 180) & (g <  80) & (r <  80)
     mask_red    = (r > 180) & (g <  80) & (b <  80)
     mask_purple = (r > 80) & (b > 80) & (g < 80) & (np.abs(r - b) < 80)
+    # Cyan: B y G altos, R bajo
+    mask_cyan   = (b > 150) & (g > 150) & (r < 80)
+    # Amarillo: R y G altos, B bajo
+    mask_yellow = (r > 150) & (g > 150) & (b < 80)
 
     # Todos los píxeles de color son transitables para el BFS
-    mask_navigable = mask_purple | mask_green | mask_blue | mask_red
+    mask_navigable = (mask_purple | mask_green | mask_blue | mask_red |
+                      mask_cyan | mask_yellow)
 
     return {
-        'search':     mask_green,                   # solo verdes
-        'nav':        mask_blue,                    # solo azules
-        'both':       mask_red,                     # rojos (búsqueda+nav)
-        'search_all': mask_green | mask_red,        # todos los de búsqueda
-        'nav_all':    mask_blue  | mask_red,        # todos los de tránsito
+        'search':     mask_green,
+        'nav':        mask_blue,
+        'both':       mask_red,
+        'search_all': mask_green | mask_red | mask_cyan | mask_yellow,
+        'nav_all':    mask_blue  | mask_red,
         'purple':     mask_purple,
-        'navigable':  mask_navigable,               # BFS usa esta
+        'cyan':       mask_cyan,
+        'yellow':     mask_yellow,
+        'navigable':  mask_navigable,
     }
 
 
@@ -191,13 +203,15 @@ def build_route_masks(route_img: np.ndarray):
 # ═══════════════════════════════════════════════════════════════════════
 
 def extract_search_waypoints(zone_mask, route_search_mask, conv,
-                              search_green_mask=None,
+                              route_masks=None,
                               subsample=SEARCH_WP_SUBSAMPLE,
                               min_dist_m=SEARCH_WP_MIN_DIST):
     """
-    Devuelve lista de (ox, oy, is_green).
-      is_green=True  → verde (se marca como visitado al escanearlo)
-      is_green=False → rojo  (nunca se marca visitado, escanea siempre)
+    Devuelve lista de (ox, oy, wp_type) donde wp_type es uno de:
+      'green'  → se marca visitado; misión 2 mira a 90° y 270°
+      'yellow' → se marca visitado; mira solo a 0°
+      'cyan'   → se marca visitado; mira solo a 180°
+      'red'    → nunca visitado; mira a 0° (misión 1) o según misión
     """
     zone_route = route_search_mask & zone_mask
     ys, xs = np.where(zone_route)
@@ -211,13 +225,23 @@ def extract_search_waypoints(zone_mask, route_search_mask, conv,
     candidates = []
     for px, py in pixels:
         ox, oy = conv.pixel_to_odom(px, py)
-        is_green = bool(search_green_mask[py, px]) if search_green_mask is not None else True
-        candidates.append((ox, oy, is_green))
+        if route_masks is not None:
+            if route_masks['yellow'][py, px]:
+                wp_type = 'yellow'
+            elif route_masks['cyan'][py, px]:
+                wp_type = 'cyan'
+            elif route_masks['search'][py, px]:
+                wp_type = 'green'
+            else:
+                wp_type = 'red'
+        else:
+            wp_type = 'green'
+        candidates.append((ox, oy, wp_type))
 
     waypoints = [candidates[0]]
-    for ox, oy, ig in candidates[1:]:
+    for ox, oy, t in candidates[1:]:
         if math.hypot(ox - waypoints[-1][0], oy - waypoints[-1][1]) >= min_dist_m:
-            waypoints.append((ox, oy, ig))
+            waypoints.append((ox, oy, t))
     return waypoints
 
 
@@ -405,19 +429,21 @@ class MissionManagerNode(Node):
 
         # Pre-calcular waypoints por zona
         self.search_waypoints = {}
-        for zone in ('carga', 'racks'):
+        for zone in ('carga', 'racks', 'descarga'):
             wps = extract_search_waypoints(
                 self.zone_masks[zone],
                 self.route_masks['search_all'],
                 self.conv,
-                search_green_mask=self.route_masks['search'],
+                route_masks=self.route_masks,
             )
             self.search_waypoints[zone] = wps
-            n_g = sum(1 for *_, ig in wps if ig)
-            n_r = len(wps) - n_g
+            n_g = sum(1 for *_, t in wps if t == 'green')
+            n_r = sum(1 for *_, t in wps if t == 'red')
+            n_c = sum(1 for *_, t in wps if t == 'cyan')
+            n_y = sum(1 for *_, t in wps if t == 'yellow')
             self.get_logger().info(
-                f'Zona {zone}: {len(wps)} waypoints de búsqueda '
-                f'({n_g} verdes[visitables], {n_r} rojos[siempre activos])')
+                f'Zona {zone}: {len(wps)} waypoints '
+                f'({n_g}V {n_r}R {n_c}C {n_y}Y)')
 
         self.nav_waypoints = {}
         for zone in ('carga', 'racks', 'descarga'):
@@ -428,7 +454,7 @@ class MissionManagerNode(Node):
                 f'Zona {zone}: {len(wps)} waypoints de navegación')
 
         # ── Estado principal ──────────────────────────────────────────
-        self.state           = 'IDLE'
+        self.state           = 'LIFT_PALLET'
         self.current_mission = None
         self.current_zone    = None
 
@@ -448,6 +474,17 @@ class MissionManagerNode(Node):
         self.latest_aruco_msg = None
         self.latest_qr_msg    = None
         self.state_start_time = self.get_clock().now()
+
+        # Detección de truck
+        self._qr_mark    = None   # último mark leído de /qr/mark_detected
+        self._yolo_mark  = None   # último mark leído de /yolo/mark_detected
+
+        # Sub-FSM FIND_TRUCK (mismo esquema que SEARCH_QR misión 1)
+        self._truck_sub_state   = 'MOVE_TO_WP'
+        self._truck_wp_idx      = 0
+        self._truck_wps_ordered = []   # waypoints de zona descarga
+        self._truck_wp_published = False
+        self._truck_scan_timer  = 0.0
 
         # ── Sub-FSM búsqueda de QR ────────────────────────────────────
         self._search_sub_state   = 'MOVE_TO_WP'
@@ -476,6 +513,8 @@ class MissionManagerNode(Node):
         self.create_subscription(String, '/nav/status',   self._nav_status_cb,     10)
         self.create_subscription(String, '/forklift/status', self._forklift_status_cb, 10)
         self.create_subscription(Bool,   '/qr/detected',  self._qr_detected_cb,    10)
+        self.create_subscription(String, '/qr/mark_detected',   self._qr_mark_cb,   10)
+        self.create_subscription(String, '/yolo/mark_detected', self._yolo_mark_cb, 10)
         self.create_subscription(Bool,   '/qr/centered',  self._qr_centered_cb,    10)
         self.create_subscription(
             PoseWithCovarianceStamped, '/aruco/pose_centered', self._pose_cb, 10)
@@ -507,6 +546,8 @@ class MissionManagerNode(Node):
             return
         self.current_mission = mission
         self.current_zone    = self.MISSION_MAP[mission]
+        self._qr_mark        = None   # resetear al iniciar misión nueva
+        self._yolo_mark      = None
         self.get_logger().info(f'Misión: {mission} → zona: {self.current_zone}')
         self._transition('NAVIGATE_TO_ZONE')
 
@@ -534,6 +575,12 @@ class MissionManagerNode(Node):
 
     def _qr_centered_cb(self, msg: Bool): self.qr_centered = msg.data
 
+    def _qr_mark_cb(self, msg: String):
+        # Solo actualizar durante búsqueda de pallet, no durante FIND_TRUCK
+        if self.state in ('SEARCH_QR', 'IDLE'):
+            self._qr_mark = msg.data.strip()
+    def _yolo_mark_cb(self, msg: String): self._yolo_mark = msg.data.strip()
+
     def _pose_cb(self, msg: PoseWithCovarianceStamped):
         from tf_transformations import euler_from_quaternion
         self.robot_x = msg.pose.pose.position.x
@@ -557,6 +604,7 @@ class MissionManagerNode(Node):
         elif self.state == 'CENTER_QR':          self._step_center_qr()
         elif self.state == 'LIFT_PALLET':        self._step_lift_pallet()
         elif self.state == 'NAVIGATE_TO_TRUCK':  self._step_navigate_to_truck()
+        elif self.state == 'FIND_TRUCK':         self._step_find_truck()
         elif self.state == 'DROP_PALLET':        self._step_drop_pallet()
         elif self.state == 'DONE':               pass
 
@@ -615,22 +663,15 @@ class MissionManagerNode(Node):
                 wp = self._search_wps_ordered[self._search_wp_idx]
                 self.get_logger().info(
                     f'MOVE_TO_WP idx={self._search_wp_idx} '
-                    f'{"verde" if wp[2] else "rojo"} '
+                    f'[{wp[2]}] '
                     f'({wp[0]:.2f},{wp[1]:.2f}) | '
-                    f'verdes visitados={len(self._green_visited)}/'
-                    f'{sum(1 for *_,ig in self._search_wps_ordered if ig)}')
+                    f'visitados={len(self._green_visited)}/'
+                    f'{sum(1 for *_,t in self._search_wps_ordered if t != "red")}')
                 return
 
             if self.nav_state == 'DONE':
                 self._move_wp_published = False
-                wp = self._search_wps_ordered[self._search_wp_idx]
-                if wp[2]:
-                    # Verde → escanear y luego marcar visitado en NEXT_WP
-                    self._enter_scan_rotate_a()
-                else:
-                    # Rojo → siempre escanear (nunca se marca visitado)
-                    self._enter_scan_rotate_a()
-                # Nota: ambos casos entran a escaneo; la diferencia es en NEXT_WP
+                self._enter_scan_rotate_a()
 
         # ── SCAN_ROTATE_A ────────────────────────────────────────────
         elif ss == 'SCAN_ROTATE_A':
@@ -646,7 +687,7 @@ class MissionManagerNode(Node):
             self._scan_sub_timer += self._scan_sub_dt
             if self._scan_sub_timer >= SCAN_WAIT_S:
                 self._qr_scan_enabled = False
-                if self.current_mission == 'mission_2':
+                if not self._scan_single_side:
                     self._enter_scan_rotate_b()
                 else:
                     self._search_sub_state = 'NEXT_WP'
@@ -670,10 +711,10 @@ class MissionManagerNode(Node):
         # ── NEXT_WP ──────────────────────────────────────────────────
         elif ss == 'NEXT_WP':
             wp = self._search_wps_ordered[self._search_wp_idx]
-            is_green = wp[2]
+            wp_type = wp[2]
 
-            # Solo los verdes se marcan como visitados
-            if is_green:
+            # Marcar visitado si es green, yellow o cyan (no red)
+            if wp_type != 'red':
                 self._green_visited.add(self._search_wp_idx)
 
             # Excluir el wp actual para que un rojo no se reelija a sí mismo
@@ -704,20 +745,20 @@ class MissionManagerNode(Node):
         """
         wps = self._search_wps_ordered
 
-        green_indices = {i for i, (*_, ig) in enumerate(wps) if ig}
-        red_indices   = {i for i, (*_, ig) in enumerate(wps) if not ig}
+        # Visitables = green, yellow, cyan  (se marcan al escanear)
+        visitable_indices = {i for i, (*_, t) in enumerate(wps) if t != 'red'}
+        red_indices       = {i for i, (*_, t) in enumerate(wps) if t == 'red'}
 
-        unvisited_green = green_indices - self._green_visited
-        if not unvisited_green:
+        unvisited = visitable_indices - self._green_visited
+        if not unvisited:
             self.get_logger().info(
-                'Todos los verdes visitados — reiniciando ciclo de búsqueda')
+                'Todos los waypoints visitados — reiniciando ciclo de búsqueda')
             self._green_visited.clear()
-            unvisited_green = green_indices
+            unvisited = visitable_indices
 
-        # Candidatos = rojos (sin el actual) + verdes no visitados
-        candidates = list((red_indices - {exclude_idx}) | unvisited_green)
+        # Candidatos = rojos (sin el actual) + visitables no visitados
+        candidates = list((red_indices - {exclude_idx}) | unvisited)
         if not candidates:
-            # Fallback: todos excepto el actual
             candidates = [i for i in range(len(wps)) if i != exclude_idx]
         if not candidates:
             candidates = list(range(len(wps)))
@@ -733,8 +774,8 @@ class MissionManagerNode(Node):
             path = bfs_path_pixels(navigable, start_px, start_py, goal_px, goal_py)
             costs[i] = len(path) if path else float('inf')
 
-        green_candidates = [i for i in candidates if wps[i][2]]
-        red_candidates   = [i for i in candidates if not wps[i][2]]
+        green_candidates = [i for i in candidates if wps[i][2] != 'red']
+        red_candidates   = [i for i in candidates if wps[i][2] == 'red']
 
         # Prioridad verdes: solo elegir rojo si supera al mejor verde por
         # mas de RED_PENALTY_PX pixeles de ruta — evita el bouncing al rojo
@@ -752,11 +793,11 @@ class MissionManagerNode(Node):
         best_idx  = min(pool, key=lambda i: costs[i])
         best_cost = costs[best_idx]
 
-        ox, oy, ig = wps[best_idx]
+        ox, oy, wp_t = wps[best_idx]
         self.get_logger().info(
-            f'_pick_next_wp → idx={best_idx} {"verde" if ig else "rojo"} '
+            f'_pick_next_wp → idx={best_idx} [{wp_t}] '
             f'({ox:.2f},{oy:.2f}) coste={best_cost}px | '
-            f'verdes visitados={len(self._green_visited)}/{len(green_indices)} | '
+            f'visitados={len(self._green_visited)}/{len(visitable_indices)} | '
             f'rojos={len(red_indices)}')
         return best_idx
 
@@ -807,6 +848,42 @@ class MissionManagerNode(Node):
             f'Path publicado: {len(pixel_path)} px → '
             f'{len(path_msg.poses)} poses (RDP ε={RDP_EPSILON}px) '
             f'hacia wp {wp_idx} ({goal_ox:.2f},{goal_oy:.2f})')
+        
+    def _publish_path_to_truck_wp(self, wp_idx: int):
+        """BFS desde posición actual hasta waypoint de truck (zona descarga)."""
+        wp = self._truck_wps_ordered[wp_idx]
+        goal_ox, goal_oy = wp[0], wp[1]
+
+        start_px, start_py = self.conv.odom_to_pixel(self.robot_x, self.robot_y)
+        goal_px,  goal_py  = self.conv.odom_to_pixel(goal_ox, goal_oy)
+
+        pixel_path = bfs_path_pixels(
+            self.route_masks['navigable'],
+            start_px, start_py,
+            goal_px,  goal_py)
+
+        if not pixel_path:
+            self.get_logger().warn(
+                f'BFS sin camino a truck wp {wp_idx} — línea recta')
+            path_msg = Path()
+            path_msg.header.frame_id = 'map'
+            path_msg.header.stamp    = self.get_clock().now().to_msg()
+            for ox, oy in [(self.robot_x, self.robot_y), (goal_ox, goal_oy)]:
+                p = PoseStamped()
+                p.header = path_msg.header
+                p.pose.position.x = ox
+                p.pose.position.y = oy
+                p.pose.orientation.w = 1.0
+                path_msg.poses.append(p)
+            self.plan_pub.publish(path_msg)
+            return
+
+        path_msg = pixels_to_path_msg(pixel_path, self.conv, frame_id='map')
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        self.plan_pub.publish(path_msg)
+        self.get_logger().info(
+            f'FIND_TRUCK path: {len(pixel_path)}px → {len(path_msg.poses)} poses '
+            f'hacia wp {wp_idx} ({goal_ox:.2f},{goal_oy:.2f})')
 
     # ─────────────────────────────────────────────────────────────────
     #  HELPERS SUB-FSM ESCANEO
@@ -819,18 +896,39 @@ class MissionManagerNode(Node):
         return min(cardinals, key=lambda c: abs(wrap_angle(theta - c)))
 
     def _enter_scan_rotate_a(self):
+        """
+        Determina el ángulo del primer escaneo según misión y tipo de waypoint:
+          Misión 1 (green/red) : 0° global
+          Misión 2 green       : 90° global  (B será 270°)
+          Misión 2 yellow      : 0° global   (sin lado B)
+          Misión 2 cyan        : 180° global  (sin lado B)
+          Misión 2 red         : 90° global  (igual que green, B=270°)
+        """
+        wp = self._search_wps_ordered[self._search_wp_idx]
+        wp_type = wp[2]
+
         if self.current_mission == 'mission_1':
-            self._scan_target_theta = MISSION1_SCAN_THETA
+            self._scan_target_theta = MISSION1_SCAN_THETA   # 0°
+            self._scan_single_side  = True
+        elif wp_type == 'yellow':
+            self._scan_target_theta = 0.0                   # 0° global
+            self._scan_single_side  = True
+        elif wp_type == 'cyan':
+            self._scan_target_theta = math.pi               # 180° global
+            self._scan_single_side  = True
         else:
-            # Misión 2: cardinal más cercano a la orientación actual
-            self._scan_target_theta = wrap_angle(self._nearest_cardinal(self.robot_th) + math.pi / 2)
+            # green / red en misión 2: 90° global, luego B=270°
+            self._scan_target_theta = math.pi / 2
+            self._scan_single_side  = False
+
         self._search_sub_state = 'SCAN_ROTATE_A'
         self.get_logger().info(
-            f'SCAN_ROTATE_A → θ={math.degrees(self._scan_target_theta):.1f}°')
+            f'SCAN_ROTATE_A [{wp_type}] → θ={math.degrees(self._scan_target_theta):.1f}° '
+            f'single={self._scan_single_side}')
 
     def _enter_scan_rotate_b(self):
-        # Cardinal opuesto al lado A (siempre +180°, también cardinal)
-        self._scan_target_theta = wrap_angle(self._scan_target_theta + math.pi)
+        # Siempre 270° (opuesto a 90°), solo se llama si not _scan_single_side
+        self._scan_target_theta = -math.pi / 2   # 270° = -90°
         self._search_sub_state = 'SCAN_ROTATE_B'
         self.get_logger().info(
             f'SCAN_ROTATE_B → θ={math.degrees(self._scan_target_theta):.1f}°')
@@ -877,18 +975,124 @@ class MissionManagerNode(Node):
 
     def _step_navigate_to_truck(self):
         if self._elapsed() < 0.15:
-            goal_msg = String(); goal_msg.data = 'descarga'
-            self.goal_pub.publish(goal_msg)
-            self.get_logger().info('Navegando a descarga'); return
+            # Buscar el waypoint de descarga más cercano y trazar BFS hacia él
+            wps = self.nav_waypoints.get('descarga', [])
+            if not wps:
+                self.get_logger().warn('Sin waypoints de descarga — yendo a zona directo')
+                goal_msg = String(); goal_msg.data = 'descarga'
+                self.goal_pub.publish(goal_msg)
+                return
+
+            # Waypoint más cercano como destino inicial
+            if self.pose_ok:
+                target = min(wps, key=lambda w: math.hypot(
+                    w[0]-self.robot_x, w[1]-self.robot_y))
+            else:
+                target = wps[0]
+
+            goal_ox, goal_oy = target
+            start_px, start_py = self.conv.odom_to_pixel(self.robot_x, self.robot_y)
+            goal_px,  goal_py  = self.conv.odom_to_pixel(goal_ox, goal_oy)
+
+            pixel_path = bfs_path_pixels(
+                self.route_masks['navigable'],
+                start_px, start_py,
+                goal_px,  goal_py)
+
+            if pixel_path:
+                path_msg = pixels_to_path_msg(pixel_path, self.conv, frame_id='map')
+                path_msg.header.stamp = self.get_clock().now().to_msg()
+                self.plan_pub.publish(path_msg)
+                self.get_logger().info(
+                    f'NAVIGATE_TO_TRUCK: path BFS {len(pixel_path)}px → '
+                    f'{len(path_msg.poses)} poses hacia ({goal_ox:.2f},{goal_oy:.2f})')
+            else:
+                # Fallback: goal string si BFS falla
+                self.get_logger().warn('BFS sin camino a descarga — fallback goal string')
+                goal_msg = String(); goal_msg.data = f'{goal_ox:.3f} {goal_oy:.3f}'
+                self.goal_pub.publish(goal_msg)
+            return
+
         if self.nav_state == 'DONE':
-            self.get_logger().info('Llegó a descarga → DROP_PALLET')
-            self._transition('DROP_PALLET')
+            self.get_logger().info('Llegó a descarga → FIND_TRUCK')
+            self._transition('FIND_TRUCK')
+
+    def _step_find_truck(self):
+        """
+        Sub-FSM de búsqueda de truck en zona descarga.
+        Comportamiento idéntico a SEARCH_QR misión 1:
+          MOVE_TO_WP → SCAN_ROTATE → SCAN_WAIT → NEXT_WP
+        En cada waypoint gira a 180° global y espera TRUCK_SCAN_WAIT_S.
+        Condición de éxito: /qr/mark_detected == /yolo/mark_detected
+        (ambos no vacíos y coincidentes) → DROP_PALLET.
+        """
+        ss = self._truck_sub_state
+
+        # ── Verificar coincidencia de marks durante espera ────────────
+        if ss == 'SCAN_WAIT':
+            if self._qr_mark and self._yolo_mark:
+                if self._qr_mark == self._yolo_mark:
+                    self.get_logger().info(
+                        f'Truck encontrado: qr_mark="{self._qr_mark}" '
+                        f'yolo_mark="{self._yolo_mark}" → DROP_PALLET')
+                    self._stop_robot()
+                    self._transition('DROP_PALLET')
+                    return
+                else:
+                    self.get_logger().info(
+                        f'Mark no coincide: qr="{self._qr_mark}" '
+                        f'yolo="{self._yolo_mark}" — esperando')
+
+        # ── MOVE_TO_WP ───────────────────────────────────────────────
+        if ss == 'MOVE_TO_WP':
+            if not self._truck_wp_published:
+                self._publish_path_to_truck_wp(self._truck_wp_idx)
+                self._truck_wp_published = True
+                wp = self._truck_wps_ordered[self._truck_wp_idx]
+                self.get_logger().info(
+                    f'FIND_TRUCK MOVE_TO_WP {self._truck_wp_idx+1}/'
+                    f'{len(self._truck_wps_ordered)} '
+                    f'({wp[0]:.2f},{wp[1]:.2f})')
+                return
+
+            if self.nav_state == 'DONE':
+                self._truck_wp_published = False
+                self._truck_sub_state    = 'SCAN_ROTATE'
+                self._scan_target_theta  = TRUCK_SCAN_THETA
+                self.get_logger().info(
+                    f'FIND_TRUCK SCAN_ROTATE → θ=180°')
+
+        # ── SCAN_ROTATE ───────────────────────────────────────────────
+        elif ss == 'SCAN_ROTATE':
+            if self._do_scan_rotate(TRUCK_SCAN_THETA):
+                self._stop_robot()
+                self._truck_sub_state  = 'SCAN_WAIT'
+                self._truck_scan_timer = 0.0
+                # Solo resetear yolo para evitar detección residual
+                # _qr_mark persiste toda la misión (ID del pallet cargado)
+                self._yolo_mark = None
+                self.get_logger().info('FIND_TRUCK SCAN_WAIT — buscando mark')
+
+        # ── SCAN_WAIT ─────────────────────────────────────────────────
+        elif ss == 'SCAN_WAIT':
+            self._truck_scan_timer += self._scan_sub_dt
+            if self._truck_scan_timer >= TRUCK_SCAN_WAIT_S:
+                # Tiempo agotado sin coincidencia → siguiente waypoint
+                self._truck_wp_idx += 1
+                if self._truck_wp_idx >= len(self._truck_wps_ordered):
+                    self.get_logger().info(
+                        'FIND_TRUCK: ciclo completo sin match — reiniciando')
+                    self._truck_wp_idx = 0
+                self._truck_wp_published = False
+                self._truck_sub_state    = 'MOVE_TO_WP'
 
     def _step_drop_pallet(self):
         if self._elapsed() < 0.15:
             self.get_logger().info('Bajando pallet…'); return
         if self.forklift_state == 'DONE':
             self.get_logger().info('Pallet entregado → DONE')
+            self._qr_mark   = None
+            self._yolo_mark = None
             self._transition('DONE')
 
     # ─────────────────────────────────────────────────────────────────
@@ -905,12 +1109,33 @@ class MissionManagerNode(Node):
         if new_state in ('LIFT_PALLET', 'DROP_PALLET'):
             self.forklift_state = 'IDLE'
 
+        if new_state == 'FIND_TRUCK':
+            wps = self.search_waypoints.get('descarga', [])
+            if not wps:
+                self.get_logger().warn(
+                    'Sin waypoints de búsqueda en descarga — DROP_PALLET directo')
+                self._transition('DROP_PALLET')
+                return
+            if self.pose_ok:
+                wps = sorted(wps,
+                             key=lambda w: math.hypot(
+                                 w[0]-self.robot_x, w[1]-self.robot_y))
+            self._truck_wps_ordered  = list(wps)
+            self._truck_wp_idx       = 0
+            self._truck_wp_published = False
+            self._truck_sub_state    = 'MOVE_TO_WP'
+            self._truck_scan_timer   = 0.0
+            # _qr_mark NO se resetea — persiste desde la detección del pallet
+            self._yolo_mark = None
+            self.get_logger().info(
+                f'FIND_TRUCK iniciado: {len(wps)} waypoints en descarga')
+
         if new_state == 'SEARCH_QR':
             wps = extract_search_waypoints(
                 self.zone_masks[self.current_zone],
                 self.route_masks['search_all'],
                 self.conv,
-                search_green_mask=self.route_masks['search'],
+                route_masks=self.route_masks,
             )
             if not wps:
                 self.get_logger().error(
@@ -932,14 +1157,17 @@ class MissionManagerNode(Node):
             self._search_sub_state   = 'MOVE_TO_WP'
             self._move_wp_published  = False
             self._qr_scan_enabled    = False
+            self._scan_single_side   = True
             self._scan_sub_timer     = 0.0
 
-            n_g = sum(1 for *_, ig in ordered if ig)
-            n_r = len(ordered) - n_g
+            n_g = sum(1 for *_, t in ordered if t == 'green')
+            n_r = sum(1 for *_, t in ordered if t == 'red')
+            n_c = sum(1 for *_, t in ordered if t == 'cyan')
+            n_y = sum(1 for *_, t in ordered if t == 'yellow')
             self.get_logger().info(
                 f'SEARCH_QR: {len(ordered)} wps '
-                f'({n_g} verdes[ciclo], {n_r} rojos[siempre]) | '
-                f'BFS sobre morado+verde+rojo+azul')
+                f'({n_g}V {n_r}R {n_c}C {n_y}Y) | '
+                f'BFS sobre ruta navegable')
 
     # ─────────────────────────────────────────────────────────────────
     #  UTILIDADES
@@ -962,20 +1190,25 @@ class MissionManagerNode(Node):
         msg = Bool(); msg.data = False; self.enable_pub.publish(msg)
 
     def _publish_current_image(self):
-        if self.state in ('CENTER_QR','SEARCH_QR'):
+        if self.state in ('SEARCH_QR','CENTER_QR'):
             if self.latest_qr_msg:   self.img_pub.publish(self.latest_qr_msg)
         else:
             if self.latest_aruco_msg: self.img_pub.publish(self.latest_aruco_msg)
 
     def _publish_status(self):
-        sub = self._search_sub_state if self.state == 'SEARCH_QR' else '-'
-        n_g = sum(1 for *_, ig in self._search_wps_ordered if ig)
+        sub = '-'
+        if self.state == 'SEARCH_QR':
+            sub = self._search_sub_state
+        elif self.state ==  'FIND_TRUCK' :
+            sub = self._truck_sub_state
+        
+        n_vis = sum(1 for *_, t in self._search_wps_ordered if t != 'red')
         msg = String()
         msg.data = (
             f'state={self.state} | sub={sub} | '
             f'mission={self.current_mission} | zone={self.current_zone} | '
             f'wp={self._search_wp_idx}/{len(self._search_wps_ordered)} '
-            f'green_visited={len(self._green_visited)}/{n_g} | '
+            f'visited={len(self._green_visited)}/{n_vis} | '
             f'qr={self.qr_detected} | qr_scan={self._qr_scan_enabled} | '
             f'nav={self.nav_state} | '
             f'x={self.robot_x:.2f} y={self.robot_y:.2f} '

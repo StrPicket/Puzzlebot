@@ -36,9 +36,9 @@ import math
 # ═══════════════════════════════════════════════════════════════════════
 
 # Ganancias de control
-KP_V      = 0.20    # proporcional velocidad lineal
-KI_V      = 0.17    # integral velocidad lineal
-KP_W      = 0.15    # proporcional velocidad angular
+KP_V      = 0.30    # proporcional velocidad lineal
+KV_V      = 0.01    # integral velocidad lineal
+KP_W      = 0.30    # proporcional velocidad angular
 KV_W      = 0.02    # amortiguación velocidad angular (usa w_robot de odom)
 
 # Límites de velocidad
@@ -46,7 +46,7 @@ V_MAX     = 0.15    # m/s
 OMEGA_MAX = 0.15    # rad/s
 
 # Tolerancias
-GOAL_DIST_TOL  = 0.1   # m — radio para considerar waypoint alcanzado
+GOAL_DIST_TOL  = 0.15   # m — radio para considerar waypoint alcanzado
 ANGLE_PRIORITY = math.radians(5)  # rad (~3°) — umbral para activar movimiento lineal
 
     
@@ -109,7 +109,11 @@ class WaypointControllerNode(Node):
         self.x      = 0.0
         self.y      = 0.0
         self.theta  = 0.0
+        self.v_robot = 0.0
         self.w_robot = 0.0   # velocidad angular del robot (de /odom)
+
+        self.u_v = 0.0
+        self.u_w = 0.0
 
         self.int_error_d = 0.0
         self.x_start     = 0.0
@@ -174,6 +178,7 @@ class WaypointControllerNode(Node):
 
     def _odom_callback(self, msg: Odometry):
         # w_robot siempre se toma de /odom (velocidad instantánea)
+        self.v_robot = msg.twist.twist.linear.x
         self.w_robot = msg.twist.twist.angular.z
 
         if self.kf_pose_active:
@@ -202,7 +207,7 @@ class WaypointControllerNode(Node):
     # ─────────────────────────────────────────────────────────────────
 
     def _other_node_has_control(self) -> bool:
-        scanning    = self.mission_sub_status in ('SCAN_ROTATE_A', 'SCAN_ROTATE_B')
+        scanning    = self.mission_sub_status in ('SCAN_ROTATE','SCAN_ROTATE_A', 'SCAN_ROTATE_B')
         forklift_op = self.mission_status in ('CENTER_QR', 'LIFT_PALLET', 'DROP_PALLET')
         return scanning or forklift_op
 
@@ -217,6 +222,7 @@ class WaypointControllerNode(Node):
             f'state={self.state} | wp={self.wp_idx}/{len(self.waypoints)} | '
             f'bug2={self.bug2_active} | '
             f'x={self.x:.2f} y={self.y:.2f} th={math.degrees(self.theta):.1f}°'
+            f'u_v={self.u_v} u_w={self.u_w}' 
         )
         
         self.status_pub.publish(status)
@@ -280,38 +286,31 @@ class WaypointControllerNode(Node):
         return cmd
 
     def _go_to_goal(self, dist, error_theta, dt) -> Twist:
-        cmd = Twist()
+            cmd = Twist()
 
-        # Waypoint alcanzado
-        if dist < GOAL_DIST_TOL:
-            self.wp_idx      += 1
-            self.int_error_d  = 0.0
-            if self.wp_idx >= len(self.waypoints):
-                self.state = 'DONE'
-                self.get_logger().info('✓ Último waypoint alcanzado — DONE')
-            else:
-                self.state = 'ROTATE_TO_GOAL'
-                self.get_logger().info(
-                    f'Waypoint {self.wp_idx} alcanzado → ROTATE_TO_GOAL')
+            if dist < GOAL_DIST_TOL:
+                self.wp_idx += 1
+                if self.wp_idx >= len(self.waypoints):
+                    self.state = 'DONE'
+                    self.get_logger().info('✓ Último waypoint alcanzado — DONE')
+                else:
+                    self.state = 'ROTATE_TO_GOAL'
+                    self.get_logger().info(
+                        f'Waypoint {self.wp_idx} alcanzado → ROTATE_TO_GOAL')
+                return cmd
+
+            if abs(error_theta) > ANGLE_PRIORITY:
+                cmd.angular.z = clamp(
+                    KP_W * error_theta - KV_W * self.w_robot,
+                    -OMEGA_MAX, OMEGA_MAX)
+                return cmd
+
+            self.u_v = clamp(KP_V * dist - KV_V * self.v_robot, 0.0, V_MAX)
+            self.u_w = clamp(KP_W * error_theta - KV_W * self.w_robot, -OMEGA_MAX, OMEGA_MAX)
+
+            cmd.linear.x  = self.u_v
+            cmd.angular.z = self.u_w
             return cmd
-
-        # Prioridad angular: si el error de ángulo es grande, solo girar
-        if abs(error_theta) > ANGLE_PRIORITY:
-            self.int_error_d = 0.0
-            cmd.angular.z = clamp(
-                KP_W * error_theta - KV_W * self.w_robot,
-                -OMEGA_MAX, OMEGA_MAX)
-            return cmd
-
-        # Control PI lineal + P angular
-        self.int_error_d = clamp(self.int_error_d + dist * dt, -2.0, 2.0)
-        dr  = math.hypot(self.x - self.x_start, self.y - self.y_start)
-        u_v = clamp(KI_V * self.int_error_d - KP_V * dr, 0.0, V_MAX)
-        u_w = clamp(KP_W * error_theta - KV_W * self.w_robot, -OMEGA_MAX, OMEGA_MAX)
-
-        cmd.linear.x  = u_v
-        cmd.angular.z = u_w
-        return cmd
     
     def _publish_waypoint_markers(self):
         ma = MarkerArray()

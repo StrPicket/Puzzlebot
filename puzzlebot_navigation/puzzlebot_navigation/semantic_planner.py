@@ -76,6 +76,7 @@ from collections import defaultdict
 
 SEMANTIC_MAP_PATH = "/home/strpicket/semantic_map.png"
 ROUTE_MAP_PATH    = "/home/strpicket/route_map.png"
+WAYPOINTS_MAP_PATH = "/home/strpicket/waypoint_map.png"
 MAP_RESOLUTION    = 0.05        # m/pixel
 
 # Radio en píxeles para considerar que el robot "está sobre" una ruta
@@ -217,30 +218,45 @@ class RouteGraph:
         return dist <= radius
 
     def _line_on_route(self, p1, p2) -> bool:
-        """
-        Verifica que todos los puntos del segmento p1→p2 estén
-        sobre la máscara de ruta (Bresenham).
-        """
+        from collections import deque
         x0, y0 = p1
         x1, y1 = p2
-        dx, dy  = abs(x1 - x0), abs(y1 - y0)
-        sx      = 1 if x0 < x1 else -1
-        sy      = 1 if y0 < y1 else -1
-        err     = dx - dy
-        x, y    = x0, y0
-        while True:
-            if not (0 <= x < self.W and 0 <= y < self.H):
-                return False
-            if not self.mask[y, x]:
-                return False
-            if x == x1 and y == y1:
-                break
-            e2 = 2 * err
-            if e2 > -dy:
-                err -= dy; x += sx
-            if e2 < dx:
-                err += dx; y += sy
-        return True
+        if (x0, y0) == (x1, y1):
+            return True
+
+        # Snap inicio y fin al píxel morado más cercano
+        (x0, y0), _ = self.nearest_route_pixel(x0, y0)
+        (x1, y1), _ = self.nearest_route_pixel(x1, y1)
+
+        if (x0, y0) == (x1, y1):
+            return True
+
+        max_dist = math.hypot(x1-x0, y1-y0) * 3
+
+        visited = set()
+        queue   = deque([(x0, y0)])
+        visited.add((x0, y0))
+
+        while queue:
+            cx, cy = queue.popleft()
+            if cx == x1 and cy == y1:
+                return True
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    nx, ny = cx+dx, cy+dy
+                    if (nx, ny) in visited:
+                        continue
+                    if not (0 <= nx < self.W and 0 <= ny < self.H):
+                        continue
+                    if not self.mask[ny, nx]:
+                        continue
+                    if math.hypot(nx-x0, ny-y0) > max_dist:
+                        continue
+                    visited.add((nx, ny))
+                    queue.append((nx, ny))
+        return False
 
     def find_path(self, start_px, goal_px):
         """
@@ -406,6 +422,7 @@ class SemanticPlannerNode(Node):
         # ── Cargar mapas ──────────────────────────────────────────────
         self.semantic_img = load_image(SEMANTIC_MAP_PATH, "semantic_map")
         self.route_img    = load_image(ROUTE_MAP_PATH,    "route_map")
+        waypoints_img = load_image(WAYPOINTS_MAP_PATH, "waypoints_map")
 
         H, W, _ = self.semantic_img.shape
         self.conv = CoordConverter(W, H, MAP_RESOLUTION)
@@ -413,6 +430,9 @@ class SemanticPlannerNode(Node):
         self.nav, self.zones, self.dist_map = build_semantic_masks(self.semantic_img)
         route_mask = build_route_mask(self.route_img)
         self.route_graph = RouteGraph(route_mask)
+
+        self.waypoints_px, self.wp_graph = self._extract_waypoints(waypoints_img)
+        self.get_logger().info(f'Waypoints cargados: {len(self.waypoints_px)}')
 
         n_route = int(route_mask.sum())
         self.get_logger().info(
@@ -576,6 +596,89 @@ class SemanticPlannerNode(Node):
     #  PLANIFICACIÓN DUAL
     # ─────────────────────────────────────────────────────────────────
 
+    def _extract_waypoints(self, img: np.ndarray):
+        """
+        Extrae centroides de waypoints (rojo/azul) y construye un grafo
+        conectando los que tienen línea de visión sobre el route_mask.
+        Devuelve lista de (px,py) y grafo de adyacencia.
+        """
+        b, g, r = img[:,:,0], img[:,:,1], img[:,:,2]
+        red  = (r > 180) & (g < 80) & (b < 80)
+        blue = (b > 180) & (g < 80) & (r < 80)
+        mask = red | blue
+
+        ys, xs = np.where(mask)
+        if len(xs) == 0:
+            return [], {}
+
+        # Agrupar píxeles cercanos en centroides
+        points = np.column_stack([xs, ys]).astype(np.float32)
+        MIN_DIST = 10
+        centroids = []
+        used = np.zeros(len(points), dtype=bool)
+        for i in range(len(points)):
+            if used[i]:
+                continue
+            cluster = [points[i]]
+            for j in range(i+1, len(points)):
+                if not used[j] and np.hypot(*(points[i]-points[j])) < MIN_DIST:
+                    cluster.append(points[j])
+                    used[j] = True
+            used[i] = True
+            c = np.mean(cluster, axis=0)
+            centroids.append((int(c[0]), int(c[1])))
+
+        # Construir grafo: conectar waypoints con línea de visión sobre route_mask
+        graph = defaultdict(list)
+        for i in range(len(centroids)):
+            for j in range(i+1, len(centroids)):
+                if self.route_graph._line_on_route(centroids[i], centroids[j]):
+                    d = math.hypot(centroids[i][0]-centroids[j][0],
+                                centroids[i][1]-centroids[j][1])
+                    graph[i].append((j, d))
+                    graph[j].append((i, d))
+
+        for i, wp in enumerate(centroids):
+            neighbors = [(j, round(d,1)) for j,d in graph[i]]
+            self.get_logger().info(f'  wp[{i}]={wp} → vecinos: {neighbors}')
+
+        self.get_logger().info(
+            f'  Grafo de waypoints: {len(centroids)} nodos, '
+            f'{sum(len(v) for v in graph.values())//2} aristas')
+        return centroids, graph
+
+
+    def _dijkstra_waypoints(self, idx_start: int, idx_goal: int):
+        """Dijkstra sobre el grafo de waypoints."""
+        dist  = {idx_start: 0.0}
+        prev  = {}
+        heap  = [(0.0, idx_start)]
+        visited = set()
+
+        while heap:
+            d, u = heapq.heappop(heap)
+            if u in visited:
+                continue
+            visited.add(u)
+            if u == idx_goal:
+                break
+            for v, w in self.wp_graph[u]:
+                nd = d + w
+                if nd < dist.get(v, math.inf):
+                    dist[v] = nd
+                    prev[v] = u
+                    heapq.heappush(heap, (nd, v))
+
+        if idx_goal not in dist:
+            return None
+        path = []
+        cur = idx_goal
+        while cur != idx_start:
+            path.append(cur)
+            cur = prev[cur]
+        path.append(idx_start)
+        return path[::-1]
+
     def _plan(self, goal_px, description=""):
         """
         Planificación en tres fases:
@@ -641,32 +744,40 @@ class SemanticPlannerNode(Node):
             log.info(f'    {len(seg0)} px crudos → {len(seg0_s)} waypoints')
             full_path.extend(seg0_s)
 
-        # ── FASE 1: navegación por rutas ──────────────────────────────
-        goal_on_route = self.route_graph.on_route(*goal_px)
-
-        if goal_on_route:
-            exit_snap, _ = self.route_graph.nearest_route_pixel(*goal_px)
+        # ── FASE 1: grafo de waypoints predefinidos ───────────────────
+        if not self.waypoints_px:
+            log.warn('  Fase 1: sin waypoints — saltando')
+            exit_snap = entry_snap
         else:
-            exit_snap, _ = self.route_graph.nearest_route_pixel(*goal_px)
+            # Waypoint más cercano al entry_snap y al goal
+            dists_entry = [math.hypot(wp[0]-entry_snap[0], wp[1]-entry_snap[1])
+                           for wp in self.waypoints_px]
+            dists_goal  = [math.hypot(wp[0]-gx, wp[1]-gy)
+                           for wp in self.waypoints_px]
+            idx_entry = int(np.argmin(dists_entry))
+            idx_goal  = int(np.argmin(dists_goal))
 
-        log.info(f'  Fase 1: ruta  {entry_snap} → {exit_snap}')
+            log.info(f'  Fase 1: wp[{idx_entry}]={self.waypoints_px[idx_entry]} → '
+                     f'wp[{idx_goal}]={self.waypoints_px[idx_goal]}')
 
-        if entry_snap != exit_snap:
-            route_path = self.route_graph.find_path(entry_snap, exit_snap)
-            if route_path is None:
-                log.error('  Fase 1: no se encontró camino en el grafo de rutas')
-                return
-            # smooth_direction elimina waypoints intermedios en líneas rectas
-            # dejando solo los puntos donde la ruta cambia de dirección.
-            # Esto evita paradas innecesarias cuando el robot ya está en la ruta.
-            route_s = smooth_direction(subsample_path(route_path, ROUTE_SUBSAMPLE))
-            log.info(f'    {len(route_path)} px de ruta → {len(route_s)} waypoints (tras smooth)')
-            # Evitar duplicar el punto de entrada que ya puede estar en full_path
-            if full_path and route_s and route_s[0] == full_path[-1]:
-                route_s = route_s[1:]
-            full_path.extend(route_s)
-        else:
-            log.info('    Entrada y salida en el mismo nodo de ruta')
+            if idx_entry == idx_goal:
+                exit_snap = self.waypoints_px[idx_goal]
+            else:
+                wp_indices = self._dijkstra_waypoints(idx_entry, idx_goal)
+                if wp_indices is None:
+                    log.error('  Fase 1: Dijkstra en waypoints falló')
+                    return
+                for idx in wp_indices:
+                    wp = self.waypoints_px[idx]
+                    if full_path and math.hypot(wp[0]-full_path[-1][0],
+                                                wp[1]-full_path[-1][1]) < 3:
+                        continue
+                    full_path.append(wp)
+                exit_snap = self.waypoints_px[idx_goal]
+
+            goal_on_route = self.route_graph.on_route(gx, gy)
+
+            log.info(f'    {len(wp_indices) if idx_entry != idx_goal else 1} waypoints en ruta')
 
         # ── FASE 2: llegada al destino ────────────────────────────────
         if not goal_on_route:

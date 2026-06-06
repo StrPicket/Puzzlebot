@@ -54,7 +54,8 @@ ARUCO_MAP = {
     10: (0.000 + X_OFF, Y_OFF - 2.8755,  0.0),
     19: (1.940 + X_OFF, Y_OFF - 0.0000, -math.pi / 2),
     31: (1.940 + X_OFF, Y_OFF - 3.6645,  math.pi / 2),
-}
+} 
+
 # robot real
 WHEEL_RADIUS = 0.0475
 WHEEL_BASE   = 0.19
@@ -70,15 +71,16 @@ SIGMA_BEARING = math.radians(2.5)
 SIGMA_HEADING_BASE  = math.radians(8.0)   # heading desde gamma: sigma de cerca
 SIGMA_HEADING_SLOPE = math.radians(10.0)  # + rad de sigma por metro (lejos pesa menos)
 BEARING_SIGN  = -1.0          # yaw_deg(+)=marcador a la derecha -> bearing(-)
-GATE_CHI2_1D  = 6.63          # gate heading (1 GL, 99%)
-GATE_CHI2_2D  = 9.21          # gate rango-bearing (2 GL, 99%)
+GATE_CHI2_1D  = 3.84          # gate heading (1 GL, 99%)
+GATE_CHI2_2D  = 5.99          # gate rango-bearing (2 GL, 99%)
 MAX_USE_RANGE = 4.0
-HEADING_MAX_RANGE = 3.0       # arriba de esto ni se usa el gamma para heading
-INIT_MAX_RANGE    = 1.5       # init confiable solo con marcadores asi de cerca
+HEADING_MAX_RANGE = 2       # arriba de esto ni se usa el gamma para heading
+INIT_MAX_RANGE    = 1       # init confiable solo con marcadores asi de cerca
+BEARING_MAX_DEG = 35.0  # ignorar marcadores fuera de ±35° del centro
 
 # re-localizacion (recuperarse si el filtro se pierde)
 RELOC_STD_M  = 1.0            # si la incertidumbre de posicion supera esto -> relocaliza
-RELOC_STREAK = 10             # ciclos seguidos con marcador visible pero todo rechazado
+RELOC_STREAK = 15             # ciclos seguidos con marcador visible pero todo rechazado
 
 
 def wrap_angle(a):
@@ -317,6 +319,10 @@ class PoseKalmanNode(Node):
                 sigma_r = SIGMA_R_FLOOR
             sigma_r = max(float(sigma_r), SIGMA_R_FLOOR)   # piso
             mx, my, m_yaw = ARUCO_MAP[mid]
+            # En correct_step, antes de update_landmark:
+            z_b = BEARING_SIGN * math.radians(d['yaw_deg'])
+            if abs(math.degrees(z_b)) > BEARING_MAX_DEG:
+                continue  # marcador muy de lado, fisheye lo distorsiona
             if self.ekf.update_landmark(mx, my, rng, z_b, sigma_r):
                 accepted += 1
             # heading desde la orientacion del marcador, solo si es confiable
