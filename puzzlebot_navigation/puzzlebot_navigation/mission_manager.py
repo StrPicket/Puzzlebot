@@ -71,6 +71,7 @@ from std_msgs.msg import String, Bool
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from sensor_msgs.msg import CompressedImage
+from geometry_msgs.msg import Twist
 
 import cv2
 import numpy as np
@@ -80,8 +81,8 @@ import math
 #  RUTAS DE MAPAS Y RESOLUCIÓN
 # ═══════════════════════════════════════════════════════════════════════
 
-SEMANTIC_MAP_PATH = "/home/strpicket/semantic_map.png"
-ROUTE_MAP_PATH    = "/home/strpicket/route_map.png"
+SEMANTIC_MAP_PATH = "/home/juanjo/semantic_map.png"
+ROUTE_MAP_PATH    = "/home/juanjo/waypoint_map.png"
 MAP_RESOLUTION    = 0.05   # m/pixel — debe coincidir con semantic_planner
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -89,10 +90,10 @@ MAP_RESOLUTION    = 0.05   # m/pixel — debe coincidir con semantic_planner
 # ═══════════════════════════════════════════════════════════════════════
 
 # Submuestreo de waypoints de búsqueda (cada N píxeles de ruta)
-SEARCH_WP_SUBSAMPLE = 8
+SEARCH_WP_SUBSAMPLE = 1
 
 # Distancia mínima entre waypoints de búsqueda consecutivos (m)
-SEARCH_WP_MIN_DIST = 0.20
+SEARCH_WP_MIN_DIST = 0.10
 
 # Radio para considerar que el robot ya está en la zona objetivo (m)
 ZONE_ARRIVAL_RADIUS = 0.07
@@ -115,8 +116,8 @@ SCAN_KV_W = 0.05
 QR_LOST_COUNT_THRESHOLD = 30
 
 # Orientación absoluta (rad) a la que debe girar el robot en Misión 1
-# para mirar hacia los conveyors (180° = mirando en dirección -X del mapa)
-MISSION1_SCAN_THETA = math.pi   # 180°
+# para mirar hacia los conveyors (0 = mirando en dirección -X del mapa)
+MISSION1_SCAN_THETA = 0   # 0°
 
 # Giro relativo para Misión 2 (rad).  +90° = izquierda del robot
 MISSION2_SCAN_DELTA_A = math.pi / 2.0    # +90°
@@ -251,6 +252,42 @@ def reorder_from_nearest(waypoints: list, robot_x: float, robot_y: float):
     idx = int(np.argmin(dists))
     return waypoints[idx:] + waypoints[:idx]
 
+def extract_nav_waypoints(zone_mask: np.ndarray,
+                           route_nav_mask: np.ndarray,
+                           conv: CoordConverter,
+                           subsample: int = 1,
+                           min_dist_m: float = 0.10):
+    """
+    Waypoints de navegación para una zona:
+    intersección de (azul | rojo) del route_map con la máscara de zona.
+    Igual lógica que extract_search_waypoints pero con la máscara de nav.
+    """
+    zone_route = route_nav_mask & zone_mask
+    ys, xs = np.where(zone_route)
+
+    if len(xs) == 0:
+        return []
+
+    pixels = list(zip(xs[::subsample], ys[::subsample]))
+    if not pixels:
+        return []
+
+    ordered = [pixels[0]]
+    remaining = pixels[1:]
+    while remaining:
+        last = ordered[-1]
+        dists = [math.hypot(p[0]-last[0], p[1]-last[1]) for p in remaining]
+        ordered.append(remaining.pop(int(np.argmin(dists))))
+
+    waypoints = []
+    last_ox, last_oy = None, None
+    for px, py in ordered:
+        ox, oy = conv.pixel_to_odom(px, py)
+        if last_ox is None or math.hypot(ox-last_ox, oy-last_oy) >= min_dist_m:
+            waypoints.append((ox, oy))
+            last_ox, last_oy = ox, oy
+
+    return waypoints
 
 # ═══════════════════════════════════════════════════════════════════════
 #  UTILIDADES ANGULARES
@@ -302,6 +339,17 @@ class MissionManagerNode(Node):
             self.search_waypoints[zone] = wps
             self.get_logger().info(
                 f'Zona {zone}: {len(wps)} waypoints de búsqueda (verde+rojo)')
+            
+        self.nav_waypoints = {}
+        for zone in ('carga', 'racks', 'descarga'):
+            wps = extract_nav_waypoints(
+                self.zone_masks[zone],
+                self.route_masks['nav_all'],
+                self.conv
+            )
+            self.nav_waypoints[zone] = wps
+            self.get_logger().info(
+                f'Zona {zone}: {len(wps)} waypoints de navegación (azul+rojo)')
 
         # ── Estado principal ──────────────────────────────────────────
         self.state           = 'IDLE'
@@ -470,10 +518,29 @@ class MissionManagerNode(Node):
                     f'Robot ya está en {self.current_zone} → SEARCH_QR directo')
                 self._transition('SEARCH_QR')
                 return
-            goal_msg = String()
-            goal_msg.data = self.current_zone
-            self.goal_pub.publish(goal_msg)
-            self.get_logger().info(f'Navegando a zona: {self.current_zone}')
+
+            # Encontrar el waypoint de búsqueda más cercano en la zona destino
+            wps = self.search_waypoints.get(self.current_zone, [])
+            if not wps:
+                # Fallback: enviar nombre de zona al semantic_planner
+                self.get_logger().warn(
+                    f'Sin waypoints de búsqueda para {self.current_zone} — fallback a zona')
+                goal_msg = String()
+                goal_msg.data = self.current_zone
+                self.goal_pub.publish(goal_msg)
+            else:
+                # Reordenar y tomar el más cercano como destino
+                if self.pose_ok:
+                    wps = reorder_from_nearest(wps, self.robot_x, self.robot_y)
+                nearest_x, nearest_y = wps[0]
+
+                # Publicar coordenadas al semantic_planner como "ox oy"
+                goal_msg = String()
+                goal_msg.data = f'{nearest_x:.3f} {nearest_y:.3f}'
+                self.goal_pub.publish(goal_msg)
+                self.get_logger().info(
+                    f'Navegando via rutas a primer wp de búsqueda: '
+                    f'({nearest_x:.2f}, {nearest_y:.2f})')
             return
 
         if self.nav_state == 'DONE':
@@ -579,6 +646,20 @@ class MissionManagerNode(Node):
 
     # ── Helpers sub-FSM ───────────────────────────────────────────────
 
+    def _publish_nav_plan(self, waypoints: list):
+        """Publica una lista de waypoints como nav_msgs/Path."""
+        msg = Path()
+        msg.header.frame_id = 'map'
+        msg.header.stamp    = self.get_clock().now().to_msg()
+        for ox, oy in waypoints:
+            pose = PoseStamped()
+            pose.header = msg.header
+            pose.pose.position.x = ox
+            pose.pose.position.y = oy
+            pose.pose.orientation.w = 1.0
+            msg.poses.append(pose)
+        self.plan_pub.publish(msg)
+
     def _enter_scan_rotate_a(self):
         """Calcula el ángulo objetivo A y entra en SCAN_ROTATE_A."""
         if self.current_mission == 'mission_1':
@@ -590,7 +671,7 @@ class MissionManagerNode(Node):
                 self.robot_th + MISSION2_SCAN_DELTA_A)
 
         self._search_sub_state = 'SCAN_ROTATE_A'
-        self._cancel_navigation()   # asegurar que el controller no interfiere
+        self._publish_status()    # asegurar que el controller no interfiere
         self.get_logger().info(
             f'SCAN_ROTATE_A → θ_target={math.degrees(self._scan_target_theta):.1f}°')
 
@@ -599,6 +680,7 @@ class MissionManagerNode(Node):
         self._scan_target_theta = wrap_angle(
             self._scan_target_theta + MISSION2_SCAN_DELTA_B)
         self._search_sub_state = 'SCAN_ROTATE_B'
+        self._publish_status() 
         self.get_logger().info(
             f'SCAN_ROTATE_B → θ_target={math.degrees(self._scan_target_theta):.1f}°')
 
@@ -608,38 +690,32 @@ class MissionManagerNode(Node):
         Devuelve True cuando se llega a la tolerancia.
         Usa control P sobre el error angular con amortiguación.
         """
-        from geometry_msgs.msg import Twist
+        
         error = wrap_angle(target_theta - self.robot_th)
 
         if abs(error) < SCAN_ANGLE_TOL:
             return True
 
         omega = clamp(
-            SCAN_KP_W * error - SCAN_KV_W * self.w_robot,
+            SCAN_KP_W * error,
             -SCAN_OMEGA, SCAN_OMEGA
         )
         cmd = Twist()
         cmd.angular.z = omega
         self.cmd_vel_pub.publish(cmd)
+        self.get_logger().info(f'error rotate:{math.degrees(error)}')
         return False
 
     def _stop_robot(self):
-        from geometry_msgs.msg import Twist
         self.cmd_vel_pub.publish(Twist())
 
     def _publish_single_wp(self, wp):
-        """Publica un único waypoint como nav_msgs/Path para el waypoint_controller."""
+        """Envía el waypoint al semantic_planner vía /goal_input para que
+        calcule la ruta por los pasillos definidos en route_map."""
         ox, oy = wp
-        msg = Path()
-        msg.header.frame_id = 'odom'
-        msg.header.stamp    = self.get_clock().now().to_msg()
-        pose = PoseStamped()
-        pose.header = msg.header
-        pose.pose.position.x = ox
-        pose.pose.position.y = oy
-        pose.pose.orientation.w = 1.0
-        msg.poses.append(pose)
-        self.plan_pub.publish(msg)
+        goal_msg = String()
+        goal_msg.data = f'{ox:.3f} {oy:.3f}'
+        self.goal_pub.publish(goal_msg)
 
     # ─────────────────────────────────────────────────────────────────
     #  CENTER_QR
