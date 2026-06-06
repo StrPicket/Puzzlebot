@@ -32,7 +32,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'segmentation_test = yolov8_detection.segmentation_test:main'
+            'Trademarks_test = yolov8_detection.Trademarks_test:main',
+            'centeryolo = yolov8_detection.centeryolo:main',
         ],
     },
 )

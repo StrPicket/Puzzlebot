@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-YoloV8Detection — ROS 2 node for instance segmentation / object detection.
+YoloV8Detection — ROS 2 node para detección con bounding boxes.
 
-Fixes vs. previous version
-───────────────────────────
-1. rqt_image_view fix   → publica en 'rgb8' (rqt no siempre renderiza bgr8)
-2. Mask alpha acumulativo → overlay se calcula desde frame original cada iteración
-3. Timer leak           → destroy_timer() antes de crear uno nuevo
-4. Warm-up del modelo   → inferencia dummy en _load_model() para eliminar lag inicial
-5. Confidence en msg    → InferenceResult ahora incluye el campo confidence
-6. NMS tuneable         → parámetro iou_threshold expuesto
-7. Log spam reducido    → logger de detecciones en DEBUG, no INFO
-8. Header sync          → imagen de salida reutiliza el header del mensaje entrante
+Cambios vs. versión con segmentación
+──────────────────────────────────────
+1. Segmentación eliminada   → sin masks, sin mask_alpha, sin overlay
+2. rqt_image_view fix       → QoS cambiado a RELIABLE (sensor_data=BEST_EFFORT lo rompe en rqt)
+3. Resto de fixes anteriores conservados (warm-up, header sync, timer leak, etc.)
 """
 
 import sys
@@ -28,8 +23,10 @@ from ament_index_python.packages import get_package_share_directory
 import rclpy
 from rclpy.node import Node
 from rclpy import qos
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import Image, CompressedImage
+from std_msgs.msg import Bool, Float32
 from yolov8_msgs.msg import InferenceResult, Yolov8Inference
 
 
@@ -46,6 +43,17 @@ def _class_color(cls_id: int) -> tuple:
     return _PALETTE[cls_id % len(_PALETTE)]
 
 
+# ── QoS compatible con rqt_image_view ────────────────────────────────────────
+# rqt_image_view usa RELIABLE; si el publisher es BEST_EFFORT no hay match
+# y la imagen nunca aparece en rqt aunque sí exista el tópico.
+_QOS_IMAGE = QoSProfile(
+    reliability=ReliabilityPolicy.RELIABLE,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,
+    durability=DurabilityPolicy.VOLATILE,
+)
+
+
 class YoloV8Detection(Node):
 
     def __init__(self):
@@ -55,12 +63,16 @@ class YoloV8Detection(Node):
         self.declare_parameter('image_topic',          '/image_raw')
         self.declare_parameter('use_compressed',       False)
         self.declare_parameter('model_name',           'best.pt')
-        self.declare_parameter('confidence_threshold', 0.45)   # ligeramente bajo para no perder detecciones
-        self.declare_parameter('iou_threshold',        0.45)   # NMS — reducir si hay muchas superposiciones
+        self.declare_parameter('confidence_threshold', 0.45)
+        self.declare_parameter('iou_threshold',        0.45)
         self.declare_parameter('update_rate',          15.0)
-        self.declare_parameter('mask_alpha',           0.40)
-        self.declare_parameter('agnostic_nms',         False)  # True: NMS entre clases
-        self.declare_parameter('half_precision',       False)  # True: FP16 (requiere CUDA)
+        self.declare_parameter('agnostic_nms',         False)
+        self.declare_parameter('half_precision',       False)
+        # Offset del "centro" como fracción del ancho de imagen [0.0 – 1.0]
+        # 0.25 = 1/4 desde la izquierda  |  0.5 = centro real
+        self.declare_parameter('center_offset',        0.25)
+        # Tolerancia de centrado como fracción del ancho total [0.0 – 1.0]
+        self.declare_parameter('center_tolerance',     0.08)
 
         self._read_all_params()
 
@@ -69,8 +81,12 @@ class YoloV8Detection(Node):
         self.model        = None
         self._image       = None
         self._image_lock  = threading.Lock()
-        # Guardamos el header del último mensaje para sincronizar el output
         self._last_header = None
+
+        # Estado de detección (actualizado en cada inferencia)
+        self._det_cx        = None   # cx del bbox más confiable detectado
+        self._det_centered  = False  # True si cx está dentro de la tolerancia
+        self._det_error_x   = 0.0   # error normalizado [-1, 1]
 
         # ── Cargar modelo ─────────────────────────────────────────────────────
         self._load_model()
@@ -79,9 +95,13 @@ class YoloV8Detection(Node):
         self.yolov8_pub = self.create_publisher(
             Yolov8Inference, 'Yolov8_Inference', qos.qos_profile_sensor_data)
 
-        # FIX: publicamos en 'rgb8' para compatibilidad con rqt_image_view
+        # FIX rqt: QoS RELIABLE para que rqt_image_view pueda suscribirse
         self.image_pub = self.create_publisher(
-            Image, 'inference_result', qos.qos_profile_sensor_data)
+            Image, 'inference_result', _QOS_IMAGE)
+
+        # Estado de centrado para el nodo de control
+        self.centered_pub = self.create_publisher(Bool,    'detection/centered', 10)
+        self.error_x_pub  = self.create_publisher(Float32, 'detection/error_x',  10)
 
         # ── Subscribers ───────────────────────────────────────────────────────
         self._create_subscriber()
@@ -109,15 +129,16 @@ class YoloV8Detection(Node):
         self.confidence_threshold = float(self.get_parameter('confidence_threshold').value)
         self.iou_threshold        = float(self.get_parameter('iou_threshold').value)
         self.update_rate          = float(self.get_parameter('update_rate').value)
-        self.mask_alpha           = float(self.get_parameter('mask_alpha').value)
         self.agnostic_nms         = bool(self.get_parameter('agnostic_nms').value)
         self.half_precision       = bool(self.get_parameter('half_precision').value)
+        self.center_offset        = float(self.get_parameter('center_offset').value)
+        self.center_tolerance     = float(self.get_parameter('center_tolerance').value)
 
     def _create_subscriber(self):
         if self.use_compressed:
             self.create_subscription(
                 CompressedImage,
-                f'{self.image_topic}/compressed',
+                self.image_topic,
                 self._image_callback,
                 qos.qos_profile_sensor_data,
             )
@@ -152,14 +173,7 @@ class YoloV8Detection(Node):
                 + ', '.join(f'{k}={v}' for k, v in sorted(self.model.names.items()))
             )
 
-            task = getattr(self.model, 'task', None)
-            if task and task != 'segment':
-                self.get_logger().warn(
-                    f'task="{task}" (se esperaba "segment"). '
-                    'Las máscaras pueden no estar disponibles.'
-                )
-
-            # FIX: warm-up para eliminar el lag de la primera inferencia real
+            # Warm-up para eliminar lag en la primera inferencia real
             self.get_logger().info('Realizando warm-up del modelo...')
             dummy = np.zeros((640, 640, 3), dtype=np.uint8)
             self.model(dummy, conf=self.confidence_threshold, verbose=False)
@@ -187,7 +201,7 @@ class YoloV8Detection(Node):
 
             with self._image_lock:
                 self._image       = frame
-                self._last_header = msg.header   # FIX: guardamos header original
+                self._last_header = msg.header
 
         except CvBridgeError as e:
             self.get_logger().error(f'CvBridgeError: {e}')
@@ -202,8 +216,8 @@ class YoloV8Detection(Node):
         with self._image_lock:
             if self._image is None or self.model is None:
                 return
-            frame        = self._image.copy()
-            last_header  = self._last_header
+            frame       = self._image.copy()
+            last_header = self._last_header
 
         try:
             results = self.model(
@@ -214,14 +228,50 @@ class YoloV8Detection(Node):
                 verbose=False,
             )
 
-            annotated      = self._draw_results(frame, results)
-            inference_msg  = self._build_inference_msg(results)
+            img_w = frame.shape[1]
 
-            # FIX: convertir a RGB antes de publicar → rqt_image_view lo renderiza correctamente
+            # ── Calcular centrado respecto al offset ──────────────────────
+            # Se toma el bbox con mayor confianza si hay varias detecciones.
+            target_x  = img_w * self.center_offset   # píxel objetivo
+            tol_px    = img_w * self.center_tolerance # tolerancia en px
+
+            best_conf = -1.0
+            best_cx   = None
+            for r in results:
+                if r.boxes is None:
+                    continue
+                for box in r.boxes:
+                    conf = float(box.conf[0])
+                    if conf > best_conf:
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        best_cx   = (x1 + x2) / 2.0
+                        best_conf = conf
+
+            if best_cx is not None:
+                self._det_cx      = best_cx
+                # error normalizado: 0 cuando cx == target_x, ±1 en los bordes
+                self._det_error_x = (best_cx - target_x) / (img_w / 2.0)
+                self._det_centered = abs(best_cx - target_x) <= tol_px
+            else:
+                self._det_cx       = None
+                self._det_error_x  = 0.0
+                self._det_centered = False
+
+            # Publicar estado de centrado
+            centered_msg = Bool()
+            centered_msg.data = bool(self._det_centered)
+            self.centered_pub.publish(centered_msg)
+            ex_msg      = Float32()
+            ex_msg.data = float(self._det_error_x)
+            self.error_x_pub.publish(ex_msg)
+
+            annotated     = self._draw_results(frame, results, target_x, tol_px)
+            inference_msg = self._build_inference_msg(results)
+
+            # Convertir BGR → RGB para publicar en rgb8
             annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
             out_msg = self.bridge.cv2_to_imgmsg(annotated_rgb, encoding='rgb8')
 
-            # FIX: reutilizar header original para mantener sincronía de timestamps
             if last_header is not None:
                 out_msg.header = last_header
             else:
@@ -235,67 +285,56 @@ class YoloV8Detection(Node):
             self.get_logger().error(f'timer_callback: {e}')
 
     # ══════════════════════════════════════════════════════════════════════════
-    # DIBUJO
+    # DIBUJO — solo bounding boxes, sin máscaras
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _draw_results(self, frame: np.ndarray, results) -> np.ndarray:
-        """
-        Dibuja máscaras, contornos, bounding boxes y etiquetas.
-
-        FIX: el overlay se calcula siempre desde 'frame' original, no desde
-        'output' acumulado → evita distorsión de color cuando hay múltiples
-        detecciones superpuestas.
-        """
+    def _draw_results(self, frame: np.ndarray, results,
+                      target_x: float, tol_px: float) -> np.ndarray:
+        """Dibuja bounding boxes, etiquetas y guías de centrado."""
         output = frame.copy()
         h, w   = frame.shape[:2]
 
-        # ── Paso 1: aplicar TODOS los rellenos de máscara de una sola vez ──────
-        if True:  # bloque para claridad
-            overlay = frame.copy()
-            for r in results:
-                if r.boxes is None or r.masks is None:
-                    continue
-                for i, box in enumerate(r.boxes):
-                    cls_id = int(box.cls[0])
-                    color  = _class_color(cls_id)
+        # ── Línea objetivo (amarilla) y banda de tolerancia (verde translúcido) ──
+        tx = int(target_x)
+        # Banda de tolerancia
+        overlay = output.copy()
+        cv2.rectangle(overlay,
+                      (max(0, tx - int(tol_px)), 0),
+                      (min(w, tx + int(tol_px)), h),
+                      (0, 200, 0), cv2.FILLED)
+        cv2.addWeighted(overlay, 0.15, output, 0.85, 0, output)
+        # Línea objetivo
+        cv2.line(output, (tx, 0), (tx, h), (0, 220, 220), 2)
+        # Etiqueta del objetivo
+        label_str = f'target x={self.center_offset:.2f}'
+        cv2.putText(output, label_str, (tx + 4, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 220), 1, cv2.LINE_AA)
 
-                    if i < len(r.masks.data):
-                        mask_raw = r.masks.data[i].cpu().numpy()
-                        mask_bin = cv2.resize(mask_raw, (w, h),
-                                              interpolation=cv2.INTER_LINEAR) > 0.5
-                        overlay[mask_bin] = color
+        # ── Estado de centrado en esquina superior izquierda ─────────────
+        status_color = (0, 255, 0) if self._det_centered else (0, 0, 255)
+        status_text  = 'CENTRADO' if self._det_centered else f'err={self._det_error_x:+.2f}'
+        cv2.putText(output, status_text, (8, h - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, status_color, 2, cv2.LINE_AA)
 
-            # FIX: blend desde el frame original (no acumulativo)
-            output = cv2.addWeighted(overlay, self.mask_alpha,
-                                     frame,   1.0 - self.mask_alpha, 0)
-
-        # ── Paso 2: contornos, bboxes y etiquetas (sin alpha) ─────────────────
+        # ── Bounding boxes ────────────────────────────────────────────────
         for r in results:
             if r.boxes is None:
                 continue
-            for i, box in enumerate(r.boxes):
+            for box in r.boxes:
                 conf   = float(box.conf[0])
                 cls_id = int(box.cls[0])
                 label  = f'{self.model.names[cls_id]} {conf:.2f}'
                 color  = _class_color(cls_id)
                 x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
-
-                # Contorno de máscara
-                if r.masks is not None and i < len(r.masks.data):
-                    mask_raw = r.masks.data[i].cpu().numpy()
-                    mask_bin = cv2.resize(mask_raw, (w, h),
-                                          interpolation=cv2.INTER_LINEAR) > 0.5
-                    contours, _ = cv2.findContours(
-                        mask_bin.astype(np.uint8),
-                        cv2.RETR_EXTERNAL,
-                        cv2.CHAIN_APPROX_SIMPLE,
-                    )
-                    cv2.drawContours(output, contours, -1, color, 2)
+                cx = (x1 + x2) // 2
 
                 # Bounding box
                 cv2.rectangle(output, (x1, y1), (x2, y2), color, 2)
 
-                # Etiqueta con fondo
+                # Línea vertical en el cx del bbox
+                cv2.line(output, (cx, y1), (cx, y2), color, 1)
+
+                # Etiqueta con fondo sólido
                 (tw, th), baseline = cv2.getTextSize(
                     label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
                 cv2.rectangle(output,
@@ -332,12 +371,10 @@ class YoloV8Detection(Node):
                 det.top        = int(coords[1])
                 det.right      = int(coords[2])
                 det.bottom     = int(coords[3])
-                # FIX: publicar confidence si el campo existe en el mensaje
                 if hasattr(det, 'confidence'):
                     det.confidence = conf
                 msg.yolov8_inference.append(det)
 
-                # FIX: nivel DEBUG para no saturar la consola en producción
                 self.get_logger().debug(
                     f'[{det.class_name}] conf={conf:.2f} '
                     f'bbox=({det.left},{det.top},{det.right},{det.bottom})'
@@ -393,19 +430,24 @@ class YoloV8Detection(Node):
                 self.update_rate = float(p.value)
                 rate_changed     = True
 
-            elif p.name == 'mask_alpha':
-                if not (isinstance(p.value, (int, float)) and 0.0 <= p.value <= 1.0):
-                    return SetParametersResult(successful=False,
-                                               reason='mask_alpha debe estar entre 0 y 1.')
-                self.mask_alpha = float(p.value)
-
             elif p.name == 'agnostic_nms':
                 if not isinstance(p.value, bool):
                     return SetParametersResult(successful=False,
                                                reason='agnostic_nms debe ser bool.')
                 self.agnostic_nms = p.value
 
-        # FIX: destruir el timer antiguo correctamente antes de crear uno nuevo
+            elif p.name == 'center_offset':
+                if not (isinstance(p.value, (int, float)) and 0.0 <= p.value <= 1.0):
+                    return SetParametersResult(successful=False,
+                                               reason='center_offset debe estar entre 0 y 1.')
+                self.center_offset = float(p.value)
+
+            elif p.name == 'center_tolerance':
+                if not (isinstance(p.value, (int, float)) and 0.0 < p.value <= 1.0):
+                    return SetParametersResult(successful=False,
+                                               reason='center_tolerance debe estar entre 0 y 1.')
+                self.center_tolerance = float(p.value)
+
         if rate_changed and hasattr(self, '_timer') and self._timer:
             self.destroy_timer(self._timer)
             self._timer = self.create_timer(1.0 / self.update_rate, self._timer_callback)
