@@ -63,7 +63,7 @@ class YoloV8Detection(Node):
         self.declare_parameter('image_topic',          '/image_raw')
         self.declare_parameter('use_compressed',       False)
         self.declare_parameter('model_name',           'best.pt')
-        self.declare_parameter('confidence_threshold', 0.45)
+        self.declare_parameter('confidence_threshold', 0.7)
         self.declare_parameter('iou_threshold',        0.45)
         self.declare_parameter('update_rate',          15.0)
         self.declare_parameter('agnostic_nms',         False)

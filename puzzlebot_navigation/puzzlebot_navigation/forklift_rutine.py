@@ -241,12 +241,12 @@ class ForkliftRutine(Node):
                 self.forklift_pre_cmd = {
                     "cmd": 1,
                     "speed": 255,
-                    "duration": 1.35
+                    "duration": 1.30
                 }
                 self.forklift_lift_cmd = {
                     "cmd": 1,
                     "speed": 255,
-                    "duration": 0.7
+                    "duration": 0.5
                 }
             elif self.current_mission == 'mission_2':
                 # Zona de racks: pallet en rack
@@ -254,12 +254,12 @@ class ForkliftRutine(Node):
                 self.forklift_pre_cmd = {
                     "cmd": 1,
                     "speed": 255,
-                    "duration": 0.7
+                    "duration": 0.5
                 }
                 self.forklift_lift_cmd = {
                     "cmd": 1,
                     "speed": 255,
-                    "duration": 0.7
+                    "duration": 0.3
                 }
             self.forklift_drop_cmd = None   # no aplica en este estado
 
@@ -271,13 +271,13 @@ class ForkliftRutine(Node):
                 self.forklift_drop_cmd = {
                     "cmd": 2,
                     "speed": 255,
-                    "duration": 0.9
+                    "duration": 1.2
                 }  # bajar pallet
             elif self.current_mission == 'mission_2':
                 self.forklift_drop_cmd = {
                     "cmd": 2,
                     "speed": 255,
-                    "duration": 0.45
+                    "duration": 0.55
                 }  # bajar pallet
             self.forklift_lift_cmd = None  # no aplica en este estado
 
