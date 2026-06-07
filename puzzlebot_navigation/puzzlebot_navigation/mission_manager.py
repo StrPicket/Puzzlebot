@@ -823,7 +823,7 @@ class MissionManagerNode(Node):
             self._scan_target_theta = MISSION1_SCAN_THETA
         else:
             # Misión 2: cardinal más cercano a la orientación actual
-            self._scan_target_theta = self._nearest_cardinal(self.robot_th)
+            self._scan_target_theta = wrap_angle(self._nearest_cardinal(self.robot_th) + math.pi / 2)
         self._search_sub_state = 'SCAN_ROTATE_A'
         self.get_logger().info(
             f'SCAN_ROTATE_A → θ={math.degrees(self._scan_target_theta):.1f}°')

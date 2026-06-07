@@ -30,6 +30,7 @@ setup(
             'mission_manager     = puzzlebot_navigation.mission_manager:main',
             'semantic_planner    = puzzlebot_navigation.semantic_planner:main',
             'waypoint_controller = puzzlebot_navigation.waypoint_controller:main',
+            'forklift_routine    = puzzlebot_navigation.forklift_routine:main',
         ],
     },
 )
