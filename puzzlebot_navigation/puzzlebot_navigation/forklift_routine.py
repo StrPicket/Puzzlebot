@@ -60,6 +60,9 @@ class ForkliftRutine(Node):
             qos.qos_profile_sensor_data)
         self.sub_mission_status = self.create_subscription(
             String, 'mission/status', self.mission_status_callback, 10)
+        self.sub_distance_reach = self.create_subscription(
+            String, 'forklift/distance', self.reaching_dist_callback, 10
+        )
         
         self.forklift_client = self.create_client(
             ForkliftCommand,
@@ -84,7 +87,7 @@ class ForkliftRutine(Node):
         # entering_dist : distancia al truck — igual para ambas misiones
         self.waypoint_dist  = 0.0
         self.reaching_dist  = 0.0
-        self.entering_dist  = 0.2   # m — distancia de entrada al truck
+        self.entering_dist  = 0.5   # m — distancia de entrada al truck
 
         # ── Comandos de forklift ─────────────────────────────────
         # forklift_pre_cmd  : altura para meter horquillas vacías (REACHING)
@@ -157,6 +160,10 @@ class ForkliftRutine(Node):
                     self.current_mission_state = new_state
                     self._on_mission_state_changed()
 
+    def reaching_dist_callback(self, msg: Float32):
+        if msg != None or msg != 0.0:
+            self.reaching_dist = msg
+
     # ── Odometría relativa ────────────────────────────────────────────────
 
     def _reset_odom(self):
@@ -209,7 +216,7 @@ class ForkliftRutine(Node):
             target_dist = abs(self.waypoint_dist)
             traveled    = abs(self.x)
             error_x     = target_dist - traveled
-            error_theta = -self.theta
+            error_theta = 0.0 - self.theta
 
             if error_x < 0.15:
                 self.cmd_vel_pub.publish(Twist())  # frenar inmediato
@@ -222,7 +229,7 @@ class ForkliftRutine(Node):
             v_cmd = max(min(v_cmd, 0.1), 0.0)
 
             w_cmd = self.Kp_w * error_theta - self.Kv_w * self.w_robot
-            w_cmd = max(min(w_cmd, 0.04), -0.04)
+            w_cmd = max(min(w_cmd, 0.1), -0.1)
 
             # En tu robot:
             # cmd negativo = avanzar
@@ -248,7 +255,6 @@ class ForkliftRutine(Node):
         if self.current_mission_state == 'LIFT_PALLET':
             if self.current_mission == 'mission_1':
                 # Zona de carga: pallet en conveyor
-                self.reaching_dist    = 0.3  # m — distancia a meter horquillas
                 self.forklift_pre_cmd = {
                     "cmd": 1,
                     "speed": 255,
@@ -261,7 +267,6 @@ class ForkliftRutine(Node):
                 }
             elif self.current_mission == 'mission_2':
                 # Zona de racks: pallet en rack
-                self.reaching_dist    = 0.3
                 self.forklift_pre_cmd = {
                     "cmd": 1,
                     "speed": 255,
@@ -276,7 +281,7 @@ class ForkliftRutine(Node):
 
         elif self.current_mission_state == 'DROP_PALLET':
             # Misma distancia de entrada al truck en ambas misiones
-            self.reaching_dist    = self.entering_dist
+            self.reaching_dist    = self.entering_dist + self.reaching_dist
             self.forklift_pre_cmd  = None  # no pre-elevar al entrar al truck
             if self.current_mission == 'mission_1':
                 self.forklift_drop_cmd = {
@@ -387,7 +392,7 @@ class ForkliftRutine(Node):
 
             if self._elapsed() > 2.0:
                 self.current_state    = 'LEAVING'
-                self.waypoint_dist    = -self.reaching_dist   # salir del truck
+                self.waypoint_dist    = -(self.reaching_dist + self.entering_dist)   # salir del truck
                 self.state_start_time = self.get_clock().now()
                 self.get_logger().info(
                     f'[FSM] DROPPING → LEAVING ({self.waypoint_dist:.2f}m)')
