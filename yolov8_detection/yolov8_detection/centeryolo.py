@@ -13,14 +13,11 @@ Calibración (medidas reales vs pnp promedio):
   real=0.77 m → pnp≈0.743 m
   => dist_real = 1.2022 * dist_pnp - 0.1232
 
-NOTA: el estimador pinhole se eliminó — el pnp solo es más preciso y
-      el pinhole inflaba sistemáticamente la distancia final.
-
 Suscripciones:
   /Yolov8_Inference    (Yolov8Inference)
 
 Publicaciones:
-  /yolo/distance       (Float32)  — distancia corregida en metros
+  /yolo/distance       (Float32)  — última distancia corregida en metros
   /yolo/detected       (Bool)
 """
 
@@ -51,15 +48,9 @@ OBJ_SIZE    = 0.10    # lado real del objeto cuadrado en metros (10 cm)
 MIN_BBOX_PX = 20.0    # lado mínimo del bbox en píxeles para procesar
 
 # ── Corrección 1: escala del bbox ─────────────────────────────────────────────
-# Compensa el padding que YOLO agrega alrededor del objeto real.
-# < 1.0 → encoge el bbox antes de solvePnP → mayor distancia estimada.
 BBOX_SCALE = 0.90
 
 # ── Corrección 2: calibración lineal sobre pnp ───────────────────────────────
-# dist_real = CALIB_SLOPE * dist_pnp + CALIB_INTERCEPT
-# Calculado por regresión sobre 2 pares reales:
-#   real=0.55 m → pnp≈0.560 m
-#   real=0.77 m → pnp≈0.743 m
 CALIB_SLOPE     =  1.2022
 CALIB_INTERCEPT = -0.1232
 
@@ -94,7 +85,8 @@ class YoloDistance(Node):
             [-h, -h, 0],
         ], dtype=np.float32)
 
-        self.prev_gamma = None
+        self.prev_gamma   = None
+        self.last_distance = 0.0   # última medición válida (publicada siempre)
 
         self.get_logger().info(
             f'YoloDistance iniciado | clases={TARGET_CLASSES or "todas"} | '
@@ -107,10 +99,6 @@ class YoloDistance(Node):
     # ══════════════════════════════════════════════════════════════════════
 
     def _undistort_points(self, img_pts: np.ndarray) -> np.ndarray:
-        """
-        Proyecta puntos fisheye al plano pinhole equivalente.
-        Resultado listo para solvePnP con D=zeros.
-        """
         pts    = img_pts.reshape(-1, 1, 2).astype(np.float64)
         undist = cv2.fisheye.undistortPoints(pts, self.K, self.D, P=self.K)
         return undist.reshape(-1, 2).astype(np.float32)
@@ -121,7 +109,6 @@ class YoloDistance(Node):
 
     @staticmethod
     def _scale_bbox(left, top, right, bottom, scale: float):
-        """Encoge el bbox desde su centro con el factor dado."""
         cx = (left  + right)  / 2.0
         cy = (top   + bottom) / 2.0
         hw = (right  - left)  / 2.0 * scale
@@ -145,7 +132,6 @@ class YoloDistance(Node):
 
     @staticmethod
     def _bbox_to_corners(left, top, right, bottom) -> np.ndarray:
-        """Orden: TL, TR, BR, BL."""
         return np.array([
             [left,  top],
             [right, top],
@@ -158,29 +144,15 @@ class YoloDistance(Node):
     # ══════════════════════════════════════════════════════════════════════
 
     def _compute_distance(self, left, top, right, bottom) -> float | None:
-        """
-        Pipeline:
-          1. Verificar tamaño mínimo (bbox original).
-          2. Escalar bbox (BBOX_SCALE) para compensar padding de YOLO.
-          3. Undistort fisheye → espacio pinhole.
-          4. solvePnPGeneric (IPPE_SQUARE) con D=zeros.
-          5. dist_pnp = sqrt(tx² + tz²).
-          6. Corrección lineal: dist_final = SLOPE * dist_pnp + INTERCEPT.
-        """
-        # 1. Tamaño mínimo
         if (right - left) < MIN_BBOX_PX or (bottom - top) < MIN_BBOX_PX:
             self.get_logger().warn(
                 f'Bbox demasiado pequeño ({right-left:.0f}×{bottom-top:.0f} px)',
                 throttle_duration_sec=1.0)
             return None
 
-        # 2. Escalar bbox
         sl, st, sr, sb = self._scale_bbox(left, top, right, bottom, BBOX_SCALE)
+        img_pts_und    = self._undistort_points(self._bbox_to_corners(sl, st, sr, sb))
 
-        # 3. Esquinas + undistort fisheye
-        img_pts_und = self._undistort_points(self._bbox_to_corners(sl, st, sr, sb))
-
-        # 4. solvePnP (D=zeros: distorsión ya eliminada)
         try:
             n, rvecs, tvecs, reproj = cv2.solvePnPGeneric(
                 self.obj_pts,
@@ -195,7 +167,6 @@ class YoloDistance(Node):
         if n == 0:
             return None
 
-        # Selección consistente de solución IPPE entre frames
         if n >= 2 and self.prev_gamma is not None:
             gammas = [self._gamma_rad(rvecs[i]) for i in range(n)]
             best_i = min(range(n),
@@ -205,18 +176,15 @@ class YoloDistance(Node):
 
         self.prev_gamma = self._gamma_rad(rvecs[best_i])
 
-        # 5. Distancia euclidiana en el plano horizontal
-        t        = tvecs[best_i].reshape(3)
-        dist_pnp = math.hypot(float(t[0]), float(t[2]))
-
-        # 6. Corrección lineal calibrada
+        t          = tvecs[best_i].reshape(3)
+        dist_pnp   = math.hypot(float(t[0]), float(t[2]))
         dist_final = CALIB_SLOPE * dist_pnp + CALIB_INTERCEPT
 
         self.get_logger().info(
             f'  pnp={dist_pnp:.3f} m  ->  final={dist_final:.3f} m',
             throttle_duration_sec=0.4)
 
-        return max(dist_final, 0.01)   # nunca negativo
+        return max(dist_final, 0.01)
 
     # ══════════════════════════════════════════════════════════════════════
     # CALLBACK DE INFERENCIA YOLO
@@ -228,7 +196,6 @@ class YoloDistance(Node):
         if TARGET_CLASSES:
             dets = [d for d in dets if d.class_name in TARGET_CLASSES]
 
-        # Bbox con mayor área (más cercano / más grande en imagen)
         best      = None
         best_area = 0.0
         for d in dets:
@@ -243,12 +210,17 @@ class YoloDistance(Node):
                 best.left, best.top, best.right, best.bottom)
 
         detected = dist is not None
+
+        # Actualizar última medición válida y siempre publicar
+        if detected:
+            self.last_distance = dist
+
         self.det_pub.publish(Bool(data=detected))
-        self.dist_pub.publish(Float32(data=float(dist) if detected else 0.0))
+        self.dist_pub.publish(Float32(data=self.last_distance))
 
         if detected:
             self.get_logger().info(
-                f'[DIST] clase={best.class_name}  dist={dist:.3f} m',
+                f'[DIST] clase={best.class_name}  dist={self.last_distance:.3f} m',
                 throttle_duration_sec=0.4)
         else:
             self.get_logger().info(

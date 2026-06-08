@@ -1,419 +1,440 @@
+#!/usr/bin/env python3
+import math
+import numpy as np
+import cv2
 import rclpy
 from rclpy import qos
 from rclpy.node import Node
-from sensor_msgs.msg import Image
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Header
-from std_msgs.msg import Float32
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Float32, String
 from geometry_msgs.msg import Twist
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
-import cv2
-import numpy as np
-import math
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  CALIBRACIÓN DE CÁMARA
-# ═══════════════════════════════════════════════════════════════════════════
 
 CAMERA_MATRIX = np.array([
-    [771.25742667,   0.0,         684.88203376],
-    [  0.0,         773.15472704,  361.72143901],
-    [  0.0,           0.0,           1.0      ]
+    [1.03795641e+03, 0.0, 6.36200746e+02],
+    [0.0, 1.03634881e+03, 3.81386102e+02],
+    [0.0, 0.0, 1.0]
 ], dtype=np.float64)
 
-DIST_COEFFS = np.array(
-    [[-4.12196743e-01,  2.39129843e-01,  9.29550695e-03,  6.35843547e-05, -7.68077937e-02]],
-    dtype=np.float64
-)
+DIST_COEFFS = np.array([[0.00383057, 0.1087906, -1.68623574, 3.76464743]], dtype=np.float64)
 
-# Lado físico del QR en metros — ajusta según tu código impreso
-QR_W = 0.09
-QR_H = 0.09
+QR_SIZE = 0.09
+READY_DIST = 0.27
 
-class centerQR(Node):
+WHITELIST = {'Emezon', 'Wolmar', 'Popsi'}
+
+TURN_SIGN = -1.0
+
+K_DIST = 0.45
+K_BEARING = 0.35
+K_LAT = 0.35
+
+V_MAX = 0.055
+V_REV_MAX = 0.025
+W_MAX = 0.04
+
+BEARING_TOL = math.radians(4.5)
+LAT_TOL = 0.020
+DIST_TOL = 0.025
+
+MIN_MARKER_PX = 20.0
+CAMERA_PITCH_DEG = 0.0
+
+
+class CenterQRVisual(Node):
+
     def __init__(self):
-        super().__init__('center_qr')
+        super().__init__('center_qr_visual')
 
-        # ── Publishers / Subscribers ──────────────────────────────────────
-        self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
-        self.image_pub = self.create_publisher(CompressedImage, '/qr/image_detected/compressed', 10)
-        self.qr_detected_pub = self.create_publisher(Bool, '/qr/detected', 10)
-        self.qr_centered_pub = self.create_publisher(Bool, '/qr/centered', 10)
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.det_pub = self.create_publisher(Bool, '/qr/detected', 10)
+        self.cen_pub = self.create_publisher(Bool, '/qr/centered', 10)
+        self.dist_pub = self.create_publisher(Float32, '/forklift/distance', 10)
+        self.mark_pub = self.create_publisher(String, '/qr/mark_detected', 10)
+        self.img_pub = self.create_publisher(
+            CompressedImage,
+            '/qr/image_detected/compressed',
+            10
+        )
 
-        self.sub_encR = self.create_subscription(
-            Float32, 'VelocityEncR', self.encR_callback, qos.qos_profile_sensor_data)
-        self.sub_encL = self.create_subscription(
-            Float32, 'VelocityEncL', self.encL_callback, qos.qos_profile_sensor_data)
+        self.create_subscription(
+            CompressedImage,
+            '/video_source/compressed',
+            self.image_cb,
+            qos.qos_profile_sensor_data
+        )
 
-        self.image_sub = self.create_subscription(
-            CompressedImage, '/video_source/compressed', self.image_callback,
-            qos.qos_profile_sensor_data)
-        
-        self.enable_sub = self.create_subscription(
-            Bool, '/center_qr/enable', self._enable_cb, 10)
+        self.create_subscription(
+            Bool,
+            '/center_qr/enable',
+            self.enable_cb,
+            10
+        )
 
-        self.timer_odom = self.create_timer(1 / 100, self.odometria)
-        self.timer_ctrl = self.create_timer(1 / 20,  self.control)
+        self.enabled = True
+        self.qr = cv2.QRCodeDetector()
 
-        self.enabled = False
+        self.K = CAMERA_MATRIX
+        self.D = DIST_COEFFS
 
-        # ── Estado odométrico ─────────────────────────────────────────────
-        self.x = 0.0
-        self.y = 0.0
-        self.theta = 0.0
-        self.wr = Float32()
-        self.wl = Float32()
-        self.w_robot = 0.0
-        self.v_robot = 0.0
+        h = QR_SIZE / 2.0
+        self.obj_pts = np.array([
+            [-h,  h, 0],
+            [ h,  h, 0],
+            [ h, -h, 0],
+            [-h, -h, 0],
+        ], dtype=np.float32)
 
-        self.radio  = 0.0505
-        self.lenght = 0.183
-
-        # ── Ganancias control lineal (ratio QR) ───────────────────────────
-        self.Kp_v = 0.15
-        self.Ki_v = 0.25
-        self.int_error_r = 0.0
-
-        # ── Ganancias control angular ─────────────────────────────────────
-        # Kp_w  → error de centrado en píxeles (igual que antes)
-        # Kp_angle → error de perpendicularidad (ángulo rvec)
-        self.Kp_w     = 0.08
-        self.Kv_w     = 0.05
-        self.Kp_angle = 0.30   # ganancia perpendicularidad (ajustable)
-
-        # ── Parámetros de detención ───────────────────────────────────────
-        # El robot se detiene cuando:
-        #   ratio      >= stop_ratio           (está suficientemente cerca)
-        #   |error_w|  <  center_tol           (centrado en X)
-        #   |error_ang|<  angle_tol            (perpendicular al QR)
-        self.stop_ratio   = 0.2
-        self.center_tol   = 0.3          # fracción del semi-ancho de imagen
-        self.angle_tol    = math.radians(3)  # 3°
-
-        # ── Imagen ───────────────────────────────────────────────────────
-        self.camera_width  = 1280
-        self.camera_height = 720
-        self.img_width     = self.camera_width
-        self.new_frame = False
-        self.frame_count = 0
-
-        # ── Detector QR ───────────────────────────────────────────────────
-        self.qr_detector = cv2.QRCodeDetector()
-
-        # Puntos 3-D del QR en su propio marco (mismo orden que OpenCV devuelve):
-        #   0=top-left, 1=top-right, 2=bottom-right, 3=bottom-left
-        hw = QR_W / 2.0
-        hh = QR_H / 2.0
-        self.obj_points = np.array([
-            [-hw,  hh, 0.0],
-            [ hw,  hh, 0.0],
-            [ hw, -hh, 0.0],
-            [-hw, -hh, 0.0],
+        p = math.radians(CAMERA_PITCH_DEG)
+        self.R_level = np.array([
+            [1, 0, 0],
+            [0, math.cos(p), -math.sin(p)],
+            [0, math.sin(p),  math.cos(p)]
         ], dtype=np.float64)
 
-        # ── Estado de detección ───────────────────────────────────────────
-        self.latest_frame  = None
-        self.latest_header = None
-        self.cx            = None
-        self.cy            = None
-        self.ratio         = 0.0
-        self.close_enough  = False
-        self.error_angle   = 0.0   # ángulo perpendicularidad en radianes
+        self.locked_id = ''
+        self.last_center = None
+        self.lost_count = 0
+        self.center_count = 0
+        self.center_need = 6
 
-        self.last_time_odom    = self.get_clock().now()
-        self.last_time_control = self.get_clock().now()
+        self.last_w = 0.0
+        self.last_v = 0.0
+        self.prev_bearing = 0.0
 
-        self.get_logger().info('centerQR node iniciado')
+        self.finished = False
 
-    # ── Callbacks imagen / encoders ───────────────────────────────────────
+        self.get_logger().info('center_qr_visual listo')
 
-    def _enable_cb(self, msg: Bool):
+    def enable_cb(self, msg):
         self.enabled = msg.data
-        if not self.enabled:
-            self.cx = None  # limpiar estado al desactivar
 
-    def image_callback(self, msg: CompressedImage):
+        if self.enabled:
+            self.finished = False
+            self.center_count = 0
+
+        else:
+            self.stop()
+            self.center_count = 0
+            self.finished = False
+
+    def stop(self):
+        self.cmd_pub.publish(Twist())
+
+    def send_cmd(self, v, w):
+        cmd = Twist()
+        cmd.linear.x = float(v)
+        cmd.angular.z = float(w)
+        self.cmd_pub.publish(cmd)
+
+    def detect_qr(self, gray):
+        gray_u = cv2.fisheye.undistortImage(gray, self.K, self.D, Knew=self.K)
+
         try:
-            np_arr = np.frombuffer(msg.data, np.uint8)
-            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-            self.latest_frame  = frame
-            self.latest_header = msg.header
-            self.new_frame = True
+            retval, infos, points, _ = self.qr.detectAndDecodeMulti(gray_u)
         except Exception as e:
-            self.get_logger().error(f'image_callback: {e}')
-            self.latest_frame  = None
-            self.latest_header = None
+            self.get_logger().warn(f'QR detect error: {e}')
+            return None, ''
 
-    def encR_callback(self, msg: Float32):
-        self.wr = msg
+        if not retval or points is None:
+            return None, ''
 
-    def encL_callback(self, msg: Float32):
-        self.wl = msg
+        candidates = []
 
-    # ── Detección y estimación de pose del QR ────────────────────────────
+        for i in range(len(points)):
+            pts = np.asarray(points[i], dtype=np.float32).reshape(-1, 2)
+            if pts.shape[0] < 4:
+                continue
 
-    def process_qr(self):
-        """
-        Detecta el QR, calcula:
-          - self.cx / self.cy : centroide en píxeles
-          - self.ratio        : tamaño relativo (lado_px / img_width)
-          - self.close_enough : True si ratio >= stop_ratio
-          - self.error_angle  : ángulo Y de perpendicularidad (rad)
-        """
-        self.cx, self.cy = None, None
-        self.error_angle  = 0.0
+            text = ''
+            if infos is not None and i < len(infos):
+                text = infos[i].strip()
 
-        if self.latest_frame is None:
+            center = pts[:4].mean(axis=0)
+            candidates.append((text, pts[:4], center))
+
+        if not candidates:
+            return None, ''
+
+        for text, pts, center in candidates:
+            if text in WHITELIST:
+                self.locked_id = text
+                self.last_center = center
+                return pts, text
+
+        if self.last_center is not None:
+            best = min(
+                candidates,
+                key=lambda c: np.linalg.norm(c[2] - self.last_center)
+            )
+            text, pts, center = best
+            self.last_center = center
+            return pts, text
+
+        text, pts, center = candidates[0]
+        self.last_center = center
+        return pts, text
+
+    def compute_pose(self, corners):
+        img_pts = corners.reshape(4, 2).astype(np.float32)
+
+        edge = (
+            np.linalg.norm(img_pts[2] - img_pts[1]) +
+            np.linalg.norm(img_pts[0] - img_pts[3])
+        ) / 2.0
+
+        if edge < MIN_MARKER_PX:
+            return None
+
+        img_pts_undist = cv2.fisheye.undistortPoints(
+            img_pts.reshape(-1, 1, 2),
+            self.K,
+            self.D,
+            P=self.K
+        ).reshape(-1, 2).astype(np.float32)
+
+        try:
+            n, rvecs, tvecs, reproj = cv2.solvePnPGeneric(
+                self.obj_pts,
+                img_pts_undist,
+                self.K,
+                None,
+                flags=cv2.SOLVEPNP_IPPE_SQUARE
+            )
+        except Exception:
+            return None
+
+        if n == 0:
+            return None
+
+        best_i = None
+        for i in range(n):
+            if tvecs[i][2, 0] > 0:
+                if best_i is None or reproj[i] < reproj[best_i]:
+                    best_i = i
+
+        if best_i is None:
+            best_i = int(np.argmin(np.array(reproj).ravel()))
+
+        rvec = rvecs[best_i]
+        tvec = tvecs[best_i]
+
+        t_lvl = (self.R_level @ tvec.reshape(3)).ravel()
+
+        tx = float(t_lvl[0])
+        ty = float(t_lvl[1])
+        tz = float(t_lvl[2])
+
+        dist = math.sqrt(tx * tx + tz * tz)
+        bearing = math.atan2(tx, tz)
+
+        return {
+            'tx': tx,
+            'ty': ty,
+            'tz': tz,
+            'dist': dist,
+            'bearing': bearing,
+            'rvec': rvec,
+            'tvec': tvec,
+            'pts': img_pts,
+            'edge': edge
+        }
+
+    def control_qr(self, pose):
+        if self.finished:
+            self.stop()
             return
 
-        frame = self.latest_frame.copy()
+        dist = pose['dist']
+        bearing = pose['bearing']
+        tx = pose['tx']
 
-        scale = 0.5
-        small = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
-        
-        retval, decoded_info, points, _ = self.qr_detector.detectAndDecodeMulti(small)
+        e_dist = dist - READY_DIST
+        e_lat = tx
 
-        # Detección — OpenCV QRCodeDetector.detect devuelve (bool, points)
-        # points tiene forma (1, 4, 2) si se detecta, None si no.
+        centered_ang = abs(bearing) < BEARING_TOL
+        centered_lat = abs(e_lat) < LAT_TOL
+        at_dist = abs(e_dist) < DIST_TOL
 
-        if retval and points is not None:
-            pts = points[0]/ scale   # (4, 2) float32: TL, TR, BR, BL
+        self.dist_pub.publish(Float32(data=float(dist)))
+        self.mark_pub.publish(String(data=self.locked_id))
 
-            # Dibujar contorno y esquinas
-            pts_int = pts.astype(int)
-            cv2.polylines(frame, [pts_int.reshape(-1, 1, 2)], True, (0, 255, 0), 2)
-            corner_colors = [(255, 0, 0), (0, 255, 255), (0, 0, 255), (255, 0, 255)]
-            for i, p in enumerate(pts_int):
-                cv2.circle(frame, tuple(p), 5, corner_colors[i], -1)
-                cv2.putText(frame, str(i), (p[0] + 6, p[1] - 6),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, corner_colors[i], 1)
+        if centered_ang and centered_lat and at_dist:
+            self.center_count += 1
+            self.stop()
 
-            # Centroide
-            cx_m = int(np.mean(pts[:, 0]))
-            cy_m = int(np.mean(pts[:, 1]))
-            cv2.circle(frame, (cx_m, cy_m), 6, (0, 255, 0), -1)
+            if self.center_count >= self.center_need:
+                self.cen_pub.publish(Bool(data=True))
+                self.finished = True
+                self.stop()
 
-            # Lado medio en píxeles → ratio de tamaño
-            avg_side_px = float(np.mean([
-                np.linalg.norm(pts[0] - pts[1]),  # top
-                np.linalg.norm(pts[3] - pts[2]),  # bottom
-            ]))
-            self.ratio        = avg_side_px / self.img_width
-            self.close_enough = self.ratio >= self.stop_ratio
+                self.get_logger().info(
+                    f'QR CENTRADO | dist={dist:.3f} m | tx={tx:+.3f} | '
+                    f'bearing={math.degrees(bearing):+.2f} deg | id={self.locked_id}',
+                    throttle_duration_sec=1.0
+                )
+            return
 
-            # ── solvePnP para estimar perpendicularidad ───────────────────
-            img_pts = pts.astype(np.float64)
-            success, rvec, tvec = cv2.solvePnP(
-                self.obj_points, img_pts,
-                CAMERA_MATRIX, DIST_COEFFS,
-                flags=cv2.SOLVEPNP_ITERATIVE
+        self.center_count = 0
+        self.cen_pub.publish(Bool(data=False))
+
+        # Si está muy descentrado, primero gira sin avanzar
+        if abs(bearing) > math.radians(12.0):
+            v = 0.0
+        else:
+            v = K_DIST * e_dist
+            v = float(np.clip(v, -V_REV_MAX, V_MAX))
+
+        # Control angular combinado
+        w_raw = TURN_SIGN * (K_BEARING * bearing + K_LAT * e_lat)
+
+        # Zona muerta: evita micro-oscilaciones
+        if abs(bearing) < math.radians(3.0) and abs(e_lat) < 0.018:
+            w = 0.0
+
+        # Cerca del QR, giro más suave
+        elif dist < 0.32:
+            w = float(np.clip(w_raw, -0.025, 0.025))
+
+        # Lejos, giro normal
+        else:
+            w = float(np.clip(w_raw, -W_MAX, W_MAX))
+
+        self.send_cmd(v, w)
+
+        self.get_logger().info(
+            f'ALIGN | dist={dist:.3f} e_dist={e_dist:+.3f} '
+            f'tx={tx:+.3f} bearing={math.degrees(bearing):+.2f} '
+            f'v={v:+.3f} w={w:+.3f}',
+            throttle_duration_sec=0.3
+        )
+
+    def draw_debug(self, frame, pose):
+        h, w = frame.shape[:2]
+        cx = int(self.K[0, 2])
+
+        cv2.line(frame, (cx, 0), (cx, h), (255, 255, 255), 1)
+
+        if pose is not None:
+            pts = pose['pts'].astype(int)
+            cv2.polylines(frame, [pts], True, (0, 255, 0), 2)
+
+            try:
+                cv2.drawFrameAxes(
+                    frame,
+                    self.K,
+                    None,
+                    pose['rvec'],
+                    pose['tvec'],
+                    QR_SIZE * 0.5,
+                    2
+                )
+            except cv2.error:
+                pass
+
+            text = (
+                f'd={pose["dist"]:.2f}m '
+                f'tx={pose["tx"]:+.2f} '
+                f'yaw={math.degrees(pose["bearing"]):+.1f}'
             )
 
-            if success:
+            cv2.putText(
+                frame,
+                text,
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2
+            )
 
-                # pts:
-                # 0 = top-left
-                # 1 = top-right
+        try:
+            _, buffer = cv2.imencode(
+                '.jpg',
+                frame,
+                [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+            )
 
-                dx = pts[1][0] - pts[0][0]
-                dy = pts[1][1] - pts[0][1]
+            img_msg = CompressedImage()
+            img_msg.header.stamp = self.get_clock().now().to_msg()
+            img_msg.format = 'jpeg'
+            img_msg.data = buffer.tobytes()
+            self.img_pub.publish(img_msg)
 
-                yaw = math.atan2(dy, dx)
+        except Exception as e:
+            self.get_logger().warn(f'publish image error: {e}')
 
-                if yaw > math.pi / 2:
-                    yaw -= math.pi
-                elif yaw < -math.pi / 2:
-                    yaw += math.pi
-
-                # Diferencia angular
-                diff = abs(yaw - self.error_angle)
-
-                # Normalización circular
-                if diff > math.pi:
-                    diff = 2 * math.pi - diff
-
-                # Alpha adaptativo
-                # Cambios pequeños -> mucho filtrado
-                # Cambios grandes -> respuesta rápida
-                if diff < math.radians(1):
-                    alpha = 0.3
-                elif diff < math.radians(3):
-                    alpha = 0.1               
-                else:
-                    alpha = 0.01
-
-                # Low-pass adaptativo
-                self.error_angle = (
-                    alpha * self.error_angle
-                    + (1.0 - alpha) * yaw
-                )
-
-                # Dibujar ejes de pose
-                cv2.drawFrameAxes(frame, CAMERA_MATRIX, DIST_COEFFS,
-                                  rvec, tvec, QR_W * 0.5)
-
-                angle_deg = math.degrees(self.error_angle)
-            else:
-                angle_deg = float('nan')
-
-            # HUD sobre el QR
-            label_color = (0, 255, 0) if self.close_enough else (0, 255, 255)
-            cv2.putText(frame,
-                f"QR ratio:{self.ratio:.2f}/{self.stop_ratio:.2f}  "
-                f"angle:{angle_deg:.1f}deg",
-                (pts_int[0][0], pts_int[0][1] - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, label_color, 2)
-
-            self.cx, self.cy = cx_m, cy_m
-
-            qr_text = decoded_info[0] if decoded_info and len(decoded_info) > 0 else "QR detectado"
-
-            cv2.putText(frame, qr_text,
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7, (0, 255, 0), 2)
-
-        else:
-            cv2.putText(frame, 'No QR detected',
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                        1.5, (0, 0, 255), 2)
-
-        # Publicar imagen anotada
-        self.frame_count += 1
-        if self.frame_count % 2 == 0:
-            try:
-                msg = CompressedImage()
-                msg.header = self.latest_header if self.latest_header is not None else Header()
-                msg.format = 'jpeg'
-                msg.data = np.array(cv2.imencode('.jpg', frame)[1]).tobytes()
-                self.image_pub.publish(msg)
-            except Exception as e:
-                self.get_logger().error(f'Error publicando imagen: {e}')
-
-
-    # ── Odometría ─────────────────────────────────────────────────────────
-
-    def odometria(self):
-        current_time = self.get_clock().now()
-        dt = (current_time - self.last_time_odom).nanoseconds * 1e-9
-        self.last_time_odom = current_time
-
-        if dt <= 0:
+    def image_cb(self, msg):
+        try:
+            frame = cv2.imdecode(
+                np.frombuffer(msg.data, np.uint8),
+                cv2.IMREAD_COLOR
+            )
+        except Exception as e:
+            self.get_logger().warn(f'decode error: {e}')
             return
 
-        v_r     = self.radio * self.wr.data
-        v_l     = self.radio * self.wl.data
-        V_avg   = (v_r + v_l) / 2.0
-        W_robot = (v_r - v_l) / self.lenght
+        if frame is None:
+            return
 
-        self.v_robot = 0.15 * self.v_robot + 0.85 * V_avg
-        self.w_robot = 0.15 * self.w_robot + 0.85 * W_robot
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
 
-        self.x     += V_avg * math.cos(self.theta) * dt
-        self.y     += V_avg * math.sin(self.theta) * dt
-        self.theta += W_robot * dt
-        self.theta  = (self.theta + math.pi) % (2 * math.pi) - math.pi
+        corners, text = self.detect_qr(gray)
+        pose = self.compute_pose(corners) if corners is not None else None
 
-    # ── Control ───────────────────────────────────────────────────────────
+        detected = pose is not None
+        self.det_pub.publish(Bool(data=detected))
 
-    def control(self):
-        if self.new_frame:          # ← solo procesar si hay frame nuevo
-            self.process_qr()
-            self.new_frame = False
-
-        # Publicar detección siempre
-        det_msg = Bool()
-        det_msg.data = self.cx is not None
-        self.qr_detected_pub.publish(det_msg)
-        
-        # Solo controlar si está habilitado
         if not self.enabled:
+            self.stop()
+            self.draw_debug(frame, pose)
             return
 
-        cmd = Twist()
+        if pose is None:
+            self.lost_count += 1
+            self.center_count = 0
+            self.cen_pub.publish(Bool(data=False))
 
-        current_time = self.get_clock().now()
-        dt = (current_time - self.last_time_control).nanoseconds * 1e-9
-        self.last_time_control = current_time
-        dt = min(dt, 0.1)
+            if self.lost_count < 10:
+                self.stop()
+            else:
+                # búsqueda lenta
+                self.send_cmd(0.0, 0.025)
 
-        # Sin detección → frenar
-        if self.cx is None:
-            cmd.linear.x  = 0.0
-            cmd.angular.z = 0.0
-            self.cmd_vel_pub.publish(cmd)
-            return
+            self.get_logger().warn(
+                'QR no detectado',
+                throttle_duration_sec=0.5
+            )
 
-        # Error de centrado horizontal normalizado [-1, 1]
-        error_w = (self.cx - self.img_width / 2.0) / (self.img_width / 2.0)
-
-        # Error de tamaño: positivo → robot lejos del QR (avanzar)
-        error_r = self.stop_ratio - self.ratio
-
-        # ── Condición de parada: centrado + cerca + perpendicular ─────────
-        if (abs(error_w) < self.center_tol
-                and self.close_enough
-                and abs(self.error_angle) < self.angle_tol):
-            cmd.linear.x  = 0.0
-            cmd.angular.z = 0.0
-            self.int_error_r = 0.0
-            self.cmd_vel_pub.publish(cmd)
-            self.qr_centered_pub.publish(Bool(data=True))
-            self.get_logger().info(
-                'QR centrado y perpendicular — robot detenido')
-            return
         else:
-            self.qr_centered_pub.publish(Bool(data=False))
+            self.lost_count = 0
+            if text:
+                self.locked_id = text
+            self.control_qr(pose)
 
-        # ── Velocidad lineal ──────────────────────────────────────────────
-        # Sólo avanzamos si el QR está razonablemente centrado Y alineado.
-        # Si hay mucho error angular o de centrado, giramos primero.
-        angle_or_center_large = (abs(error_w) > 0.12
-                                 or abs(self.error_angle) > math.radians(15))
-
-        if angle_or_center_large:
-            u_v = 0.0
-            self.int_error_r = 0.0
-        else:
-            self.int_error_r += error_r * dt
-            self.int_error_r  = max(min(self.int_error_r, 1.0), -1.0)
-
-            u_v = self.Ki_v * self.int_error_r - self.Kp_v * self.ratio
-            u_v = max(min(u_v, 0.4), -0.4)
-
-        # ── Velocidad angular ─────────────────────────────────────────────
-        # Combina dos fuentes de error:
-        #   1) error_w     : centrado en píxeles (centrar el QR en imagen)
-        #   2) error_angle : perpendicularidad  (quedar de frente al QR)
-        # El signo de cmd.angular.z es -u_w porque la cámara ve al revés.
-        u_w = (self.Kp_w * error_w
-               + self.Kp_angle * self.error_angle
-               - self.Kv_w * self.w_robot)
-        u_w = max(min(u_w, 0.25), -0.25)
-
-        cmd.linear.x  = u_v
-        cmd.angular.z = -u_w   # signo igual que en centerAruco original
-
-        self.cmd_vel_pub.publish(cmd)
-
-        theta_deg = math.degrees(self.theta) % 360
-        self.get_logger().info(
-            f'Error_r: {error_r:+.3f} | ratio: {self.ratio:.3f} | u_v: {u_v:+.3f}')
-        self.get_logger().info(
-            f'Error_w: {error_w:+.3f} | Error_angle: {math.degrees(self.error_angle):+.1f}° | '
-            f'θ: {theta_deg:.1f}° | u_w: {u_w:+.3f}')
+        self.draw_debug(frame, pose)
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = centerQR()
+    node = CenterQRVisual()
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        cv2.destroyAllWindows()
+        try:
+            node.stop()
+        except Exception:
+            pass
+
         node.destroy_node()
+
         if rclpy.ok():
             rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

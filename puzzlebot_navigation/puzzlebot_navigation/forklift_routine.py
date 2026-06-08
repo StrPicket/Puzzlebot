@@ -61,8 +61,10 @@ class ForkliftRutine(Node):
         self.sub_mission_status = self.create_subscription(
             String, 'mission/status', self.mission_status_callback, 10)
         self.sub_distance_reach = self.create_subscription(
-            String, 'forklift/distance', self.reaching_dist_callback, 10
+            Float32, 'forklift/distance', self.reaching_dist_callback, 10
         )
+        self.sub_voice_cmd = self.create_subscription(
+            String, 'voice_cmd', self.voice_cmd_callback, 10)
         
         self.forklift_client = self.create_client(
             ForkliftCommand,
@@ -87,6 +89,7 @@ class ForkliftRutine(Node):
         # entering_dist : distancia al truck — igual para ambas misiones
         self.waypoint_dist  = 0.0
         self.reaching_dist  = 0.0
+        self.drop_reaching_dist = 0.0        
         self.entering_dist  = 0.5   # m — distancia de entrada al truck
 
         # ── Comandos de forklift ─────────────────────────────────
@@ -109,6 +112,7 @@ class ForkliftRutine(Node):
         # ── Estado de la misión (recibido por tópico) ─────────────
         self.current_mission       = None   # 'mission_1' | 'mission_2'
         self.current_mission_state = None   # 'LIFT_PALLET' | 'DROP_PALLET' | …
+        self.enable_forklift = False
 
         # ── Máquina de estados interna ───────────────────────────
         # IDLE     : esperando instrucción
@@ -160,9 +164,16 @@ class ForkliftRutine(Node):
                     self.current_mission_state = new_state
                     self._on_mission_state_changed()
 
+    def voice_cmd_callback(self, msg: String):
+        voice_cmd = msg.data
+        if self.current_mission_state == 'LIFT_PALLET' and voice_cmd == 'lift':
+            self.enable_forklift = True
+        elif self.current_mission_state == 'DROP_PALLET' and voice_cmd == 'drop':
+            self.enable_forklift = True
+
     def reaching_dist_callback(self, msg: Float32):
-        if msg != None or msg != 0.0:
-            self.reaching_dist = msg
+        if msg.data != 0.0:
+            self.reaching_dist = msg.data
 
     # ── Odometría relativa ────────────────────────────────────────────────
 
@@ -281,8 +292,7 @@ class ForkliftRutine(Node):
 
         elif self.current_mission_state == 'DROP_PALLET':
             # Misma distancia de entrada al truck en ambas misiones
-            self.reaching_dist    = self.entering_dist + self.reaching_dist
-            self.forklift_pre_cmd  = None  # no pre-elevar al entrar al truck
+            self.drop_reaching_dist = self.entering_dist + self.reaching_dist
             if self.current_mission == 'mission_1':
                 self.forklift_drop_cmd = {
                     "cmd": 2,
@@ -308,7 +318,8 @@ class ForkliftRutine(Node):
         self.waypoint_dist    = 0.0
         self.waypoint_reached = False
         self.command_sent = False
-        self.current_state    = 'REACHING'
+        self.enable_forklift = False
+        self.current_state    = 'IDLE'
         self.state_start_time = self.get_clock().now()
 
         self.get_logger().info(
@@ -334,6 +345,10 @@ class ForkliftRutine(Node):
         Consume waypoint_reached producido por control().
         """
         self._publish_status()
+        # IDLE
+        if self.current_state == 'IDLE':
+            if self.enable_forklift:
+                self.current_state = 'REACHING'
 
         # ── REACHING ──────────────────────────────────────────────
         if self.current_state == 'REACHING':
@@ -379,7 +394,7 @@ class ForkliftRutine(Node):
 
             if self._elapsed() > 2.0:
                 self.current_state    = 'LEAVING'
-                self.waypoint_dist    = -self.reaching_dist   # retroceder
+                self.waypoint_dist    = self.reaching_dist   # retroceder
                 self.state_start_time = self.get_clock().now()
                 self.get_logger().info(
                     f'[FSM] LIFTING → LEAVING ({self.waypoint_dist:.2f}m)')
@@ -392,7 +407,7 @@ class ForkliftRutine(Node):
 
             if self._elapsed() > 2.0:
                 self.current_state    = 'LEAVING'
-                self.waypoint_dist    = -(self.reaching_dist + self.entering_dist)   # salir del truck
+                self.waypoint_dist    = self.drop_reaching_dist   # salir del truck
                 self.state_start_time = self.get_clock().now()
                 self.get_logger().info(
                     f'[FSM] DROPPING → LEAVING ({self.waypoint_dist:.2f}m)')
@@ -401,6 +416,7 @@ class ForkliftRutine(Node):
         elif self.current_state == 'LEAVING':
             if self.waypoint_reached:
                 self.waypoint_reached = False
+                self.enable_forklift = False
                 self.current_state    = 'DONE'
                 self.get_logger().info('[FSM] LEAVING → DONE')
 

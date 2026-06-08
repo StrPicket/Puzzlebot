@@ -48,15 +48,17 @@ Sub-FSM dentro de SEARCH_QR:
 
 Tópicos suscritos:
   /mission              — std_msgs/String
+  /voice_cmd            — std_msgs/String
   /nav/status           — std_msgs/String
   /qr/detected          — std_msgs/Bool
   /qr/centered          — std_msgs/Bool
   /qr/mark_detected     — std_msgs/String
-  /yolo/mark_detected   — std_msgs/String
+  /yolo/mark_detected   — std_msgs/Bool
   /aruco/pose_centered  — geometry_msgs/PoseWithCovarianceStamped
   /forklift/status      — std_msgs/String
   /aruco/image_detected/compressed
   /qr/image_detected/compressed
+  /yolo/image_detected/compressed
 
 Tópicos publicados:
   /goal_input           — std_msgs/String   (navegación inter-zona)
@@ -454,9 +456,10 @@ class MissionManagerNode(Node):
                 f'Zona {zone}: {len(wps)} waypoints de navegación')
 
         # ── Estado principal ──────────────────────────────────────────
-        self.state           = 'LIFT_PALLET'
+        self.state           = 'IDLE'
         self.current_mission = None
         self.current_zone    = None
+        self.last_state      = None
 
         self.robot_x  = 0.0
         self.robot_y  = 0.0
@@ -473,10 +476,10 @@ class MissionManagerNode(Node):
 
         self.latest_aruco_msg = None
         self.latest_qr_msg    = None
+        self.latest_yolo_msg  = None
         self.state_start_time = self.get_clock().now()
 
         # Detección de truck
-        self._qr_mark    = None   # último mark leído de /qr/mark_detected
         self._yolo_mark  = None   # último mark leído de /yolo/mark_detected
 
         # Sub-FSM FIND_TRUCK (mismo esquema que SEARCH_QR misión 1)
@@ -510,11 +513,12 @@ class MissionManagerNode(Node):
 
         # ── Subscribers ───────────────────────────────────────────────
         self.create_subscription(String, '/mission',      self._mission_cb,        10)
+        self.create_subscription(String, '/voice_cmd',      self._voice_cmd_cb,        10)
         self.create_subscription(String, '/nav/status',   self._nav_status_cb,     10)
         self.create_subscription(String, '/forklift/status', self._forklift_status_cb, 10)
         self.create_subscription(Bool,   '/qr/detected',  self._qr_detected_cb,    10)
         self.create_subscription(String, '/qr/mark_detected',   self._qr_mark_cb,   10)
-        self.create_subscription(String, '/yolo/mark_detected', self._yolo_mark_cb, 10)
+        self.create_subscription(Bool, '/yolo/mark_detected', self._yolo_mark_cb, 10)
         self.create_subscription(Bool,   '/qr/centered',  self._qr_centered_cb,    10)
         self.create_subscription(
             PoseWithCovarianceStamped, '/aruco/pose_centered', self._pose_cb, 10)
@@ -522,6 +526,8 @@ class MissionManagerNode(Node):
             CompressedImage, '/aruco/image_detected/compressed', self._aruco_cam_cb, 10)
         self.create_subscription(
             CompressedImage, '/qr/image_detected/compressed', self._qr_cam_cb, 10)
+        self.create_subscription(
+            CompressedImage, '/yolo/image_detected/compressed', self._yolo_cam_cb, 10)
 
         self.timer = self.create_timer(0.1, self._fsm_step)
 
@@ -535,6 +541,7 @@ class MissionManagerNode(Node):
 
     def _aruco_cam_cb(self, msg): self.latest_aruco_msg = msg
     def _qr_cam_cb(self, msg):    self.latest_qr_msg    = msg
+    def _yolo_cam_cb(self,msg):   self.latest_yolo_msg  = msg
 
     def _mission_cb(self, msg: String):
         mission = msg.data.strip().lower()
@@ -547,9 +554,20 @@ class MissionManagerNode(Node):
         self.current_mission = mission
         self.current_zone    = self.MISSION_MAP[mission]
         self._qr_mark        = None   # resetear al iniciar misión nueva
-        self._yolo_mark      = None
-        self.get_logger().info(f'Misión: {mission} → zona: {self.current_zone}')
-        self._transition('NAVIGATE_TO_ZONE')
+        self._yolo_mark      = False
+        self.get_logger().info(f'Misión: {mission} → zona: {self.current_zone} — esperando START')
+
+    def _voice_cmd_cb(self, msg: String):
+        voice_cmd = msg.data
+        if voice_cmd == 'start' and self.state == 'IDLE':
+            if self.last_state and self.last_state != 'IDLE':
+                self._transition(self.last_state)
+            elif self.current_mission:                        # ← agregar
+                self._transition('NAVIGATE_TO_ZONE')         # ← agregar
+        elif voice_cmd == 'stop':
+            self._scan_sub_timer   = 0.0
+            self._truck_scan_timer = 0.0
+            self._transition('IDLE')
 
     def _nav_status_cb(self, msg: String):
         for part in msg.data.split('|'):
@@ -577,9 +595,9 @@ class MissionManagerNode(Node):
 
     def _qr_mark_cb(self, msg: String):
         # Solo actualizar durante búsqueda de pallet, no durante FIND_TRUCK
-        if self.state in ('SEARCH_QR', 'IDLE'):
+        if self.state in ('SEARCH_QR','CENTER_QR', 'IDLE'):
             self._qr_mark = msg.data.strip()
-    def _yolo_mark_cb(self, msg: String): self._yolo_mark = msg.data.strip()
+    def _yolo_mark_cb(self, msg: Bool): self._yolo_mark = msg.data
 
     def _pose_cb(self, msg: PoseWithCovarianceStamped):
         from tf_transformations import euler_from_quaternion
@@ -607,6 +625,8 @@ class MissionManagerNode(Node):
         elif self.state == 'FIND_TRUCK':         self._step_find_truck()
         elif self.state == 'DROP_PALLET':        self._step_drop_pallet()
         elif self.state == 'DONE':               pass
+
+        self.last_state = self.state
 
     # ─────────────────────────────────────────────────────────────────
     #  NAVIGATE_TO_ZONE
@@ -1030,18 +1050,13 @@ class MissionManagerNode(Node):
 
         # ── Verificar coincidencia de marks durante espera ────────────
         if ss == 'SCAN_WAIT':
-            if self._qr_mark and self._yolo_mark:
-                if self._qr_mark == self._yolo_mark:
-                    self.get_logger().info(
-                        f'Truck encontrado: qr_mark="{self._qr_mark}" '
-                        f'yolo_mark="{self._yolo_mark}" → DROP_PALLET')
-                    self._stop_robot()
-                    self._transition('DROP_PALLET')
-                    return
-                else:
-                    self.get_logger().info(
-                        f'Mark no coincide: qr="{self._qr_mark}" '
-                        f'yolo="{self._yolo_mark}" — esperando')
+            if self._yolo_mark:
+                self.get_logger().info(
+                    f'Truck encontrado: qr_mark="{self._qr_mark}" '
+                    f'yolo_mark="{self._yolo_mark}" → DROP_PALLET')
+                self._stop_robot()
+                self._transition('DROP_PALLET')
+                return
 
         # ── MOVE_TO_WP ───────────────────────────────────────────────
         if ss == 'MOVE_TO_WP':
@@ -1070,7 +1085,7 @@ class MissionManagerNode(Node):
                 self._truck_scan_timer = 0.0
                 # Solo resetear yolo para evitar detección residual
                 # _qr_mark persiste toda la misión (ID del pallet cargado)
-                self._yolo_mark = None
+                self._yolo_mark = False
                 self.get_logger().info('FIND_TRUCK SCAN_WAIT — buscando mark')
 
         # ── SCAN_WAIT ─────────────────────────────────────────────────
@@ -1092,7 +1107,7 @@ class MissionManagerNode(Node):
         if self.forklift_state == 'DONE':
             self.get_logger().info('Pallet entregado → DONE')
             self._qr_mark   = None
-            self._yolo_mark = None
+            self._yolo_mark = False
             self._transition('DONE')
 
     # ─────────────────────────────────────────────────────────────────
@@ -1105,6 +1120,13 @@ class MissionManagerNode(Node):
         self.state_start_time = self.get_clock().now()
         self.nav_state        = 'WAIT_PLAN'
         self.qr_lost_count    = 0
+
+        if new_state == 'IDLE':                  # ← agregar este bloque
+            self._stop_robot()
+            self._cancel_navigation()
+            self._disable_center_qr()
+            self._qr_scan_enabled = False
+            return
 
         if new_state in ('LIFT_PALLET', 'DROP_PALLET'):
             self.forklift_state = 'IDLE'
@@ -1126,7 +1148,7 @@ class MissionManagerNode(Node):
             self._truck_sub_state    = 'MOVE_TO_WP'
             self._truck_scan_timer   = 0.0
             # _qr_mark NO se resetea — persiste desde la detección del pallet
-            self._yolo_mark = None
+            self._yolo_mark = False
             self.get_logger().info(
                 f'FIND_TRUCK iniciado: {len(wps)} waypoints en descarga')
 
@@ -1192,6 +1214,8 @@ class MissionManagerNode(Node):
     def _publish_current_image(self):
         if self.state in ('SEARCH_QR','CENTER_QR'):
             if self.latest_qr_msg:   self.img_pub.publish(self.latest_qr_msg)
+        elif self.state in ('FIND_TRUCK', 'DROP_PALLET'):
+            if self.latest_yolo_msg: self.img_pub.publish(self.latest_yolo_msg)
         else:
             if self.latest_aruco_msg: self.img_pub.publish(self.latest_aruco_msg)
 
