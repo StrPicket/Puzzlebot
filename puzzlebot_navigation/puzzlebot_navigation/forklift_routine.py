@@ -106,7 +106,7 @@ class ForkliftRutine(Node):
         self.Kv_v        = 0.05
 
         # ── Ganancias control angular (P + amortiguación) ────────
-        self.Kp_w = 0.15
+        self.Kp_w = 0.30
         self.Kv_w = 0.02
 
         # ── Estado de la misión (recibido por tópico) ─────────────
@@ -134,7 +134,7 @@ class ForkliftRutine(Node):
         self.state_start_time  = self.get_clock().now()
 
         self.timer_odom = self.create_timer(1 / 100, self.odometria)
-        self.timer_ctrl = self.create_timer(1 / 20,  self.control)
+        self.timer_ctrl = self.create_timer(1 / 50,  self.control)
         self.timer_fsm  = self.create_timer(1 / 10,  self._fsm_step)
 
         self.get_logger().info('forklift_rutine listo — esperando mission/status')
@@ -237,10 +237,12 @@ class ForkliftRutine(Node):
                 return
 
             v_cmd = self.Kp_v * error_x - self.Kv_v * abs(self.v_robot)
-            v_cmd = max(min(v_cmd, 0.1), 0.0)
+            v_cmd = max(min(v_cmd, 0.15), -0.15)
 
             w_cmd = self.Kp_w * error_theta - self.Kv_w * self.w_robot
             w_cmd = max(min(w_cmd, 0.1), -0.1)
+
+
 
             # En tu robot:
             # cmd negativo = avanzar
@@ -250,7 +252,8 @@ class ForkliftRutine(Node):
             elif self.current_state == 'LEAVING':
                 cmd.linear.x = - v_cmd
 
-            cmd.angular.z = w_cmd
+            cmd.angular.z = -w_cmd
+            self.get_logger().info(f'[CTRL] ex={error_x:.3f} eth={self.theta:.3f} v={v_cmd:.3f} w={w_cmd:.3f} vr={self.v_robot:.3f} wr={self.w_robot:.3f}')
 
         # En LIFTING, DROPPING, IDLE, DONE: robot quieto
         self.cmd_vel_pub.publish(cmd)
@@ -322,10 +325,10 @@ class ForkliftRutine(Node):
         self.current_state    = 'IDLE'
         self.state_start_time = self.get_clock().now()
 
-        self.get_logger().info(
-            f'[FSM] Nueva secuencia: mission={self.current_mission} '
-            f'state={self.current_mission_state} '
-            f'reaching_dist={self.reaching_dist:.2f}m')
+        #self.get_logger().info(
+        #    f'[FSM] Nueva secuencia: mission={self.current_mission} '
+        #    f'state={self.current_mission_state} '
+        #    f'reaching_dist={self.reaching_dist:.2f}m')
 
     # ── Máquina de estados ────────────────────────────────────────────────
 
@@ -359,14 +362,19 @@ class ForkliftRutine(Node):
                     self._send_forklift_cmd(self.forklift_pre_cmd)
                     self.command_sent = True
 
+                if self._elapsed() > 2.0:
+                    self.reaching_dist = 0.3
+
                 # 2. Esperar 2 s a que el forklift suba antes de avanzar
-                if self._elapsed() > 2.0 and abs(self.waypoint_dist) < 0.001:
+                if  abs(self.waypoint_dist) > 0.001:
                     self.waypoint_dist = self.reaching_dist
                     self.get_logger().info(
                         f'[REACHING] Forklift listo — avanzando {self.reaching_dist:.2f}m')
 
             elif self.current_mission_state == 'DROP_PALLET':
                 # Entrar al truck directo, sin pre-elevación
+                if self._elapsed() > 2.0:
+                    self.reaching_dist = 0.966
                 if self.waypoint_dist == 0.0:
                     self.waypoint_dist = self.reaching_dist
                     self.get_logger().info(

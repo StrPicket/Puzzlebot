@@ -19,12 +19,6 @@ def generate_launch_description():
             output='screen',
         ),
 
-        Node(
-            package='puzzlebot_navigation',
-            executable='bug2_monitor',
-            name='bug2_monitor',
-            output='screen',
-        ),
 
         Node(
             package='puzzlebot_mapping',
@@ -40,37 +34,37 @@ def generate_launch_description():
             output='screen',
         ),
 
-        # Node(
-        #     package='puzzlebot_navigation',
-        #     executable='centerQR',
-        #     name='centerQR',
-        #     output='screen',
-        # ),
+        #Node(
+        #    package='puzzlebot_navigation',
+        #    executable='centerQR',
+        #    name='centerQR',
+        #    output='screen',
+        #),
 
-        # Node(
-        #     package='yolov8_detection',
-        #     executable='centeryolo',
-        #     name='centeryolo',
-        #     output='screen',
-        # ),
+        #Node(
+        #    package='yolov8_detection',
+        #    executable='centeryolo',
+        #    name='centeryolo',
+        #    output='screen',
+        #),
 
-        Node(
-            package='yolov8_detection',
-            executable='Trademarks_test',
-            name='Trademarks_test',
-            output='screen',
-            parameters=[
-                {'image_topic': '/video_source/compressed'},
-                {'use_compressed': True}
-            ],
-        ),
+        #Node(
+        #    package='yolov8_detection',
+        #    executable='Trademarks_test',
+        #    name='Trademarks_test',
+        #    output='screen',
+        #    parameters=[
+        #        {'image_topic': '/video_source/compressed'},
+        #        {'use_compressed': True}
+        #    ],
+        #),
 
-        # Node(
-        #     package='puzzlebot_navigation',
-        #     executable='forklift_routine',
-        #     name='forklift_routine',
-        #     output='screen',
-        # ),
+        #Node(
+        #    package='puzzlebot_navigation',
+        #    executable='forklift_routine',
+        #    name='forklift_routine',
+        #    output='screen',
+        #),
 
         Node(
             package='tf2_ros',

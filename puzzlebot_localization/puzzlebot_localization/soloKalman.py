@@ -42,7 +42,7 @@ X_OFF = 0.608
 Y_OFF = 3.6645
 ARUCO_MAP = {
     0:  (3.757 + X_OFF, Y_OFF - 0.0000, -math.pi / 2),
-    1:  (4.845 + X_OFF, Y_OFF - 2.0300,  math.pi),
+    1:  (4.845 + X_OFF, Y_OFF - 2.1300,  math.pi),
     2:  (3.786 + X_OFF, Y_OFF - 3.6645,  math.pi / 2),
     3:  (1.050 + X_OFF, Y_OFF - 3.6645,  math.pi / 2),
     4:  (1.090 + X_OFF, Y_OFF - 0.0000, -math.pi / 2),
@@ -50,7 +50,7 @@ ARUCO_MAP = {
     6:  (2.530 + X_OFF, Y_OFF - 1.2430,  math.pi),
     7:  (3.590 + X_OFF, Y_OFF - 1.2430,  0.0),
     8:  (3.590 + X_OFF, Y_OFF - 2.3795,  0.0),
-    9:  (0.000 + X_OFF, Y_OFF - 0.3650,  0.0),
+    9:  (0.000 + X_OFF, Y_OFF - 0.3750,  0.0),
     10: (0.000 + X_OFF, Y_OFF - 2.8755,  0.0),
     19: (1.940 + X_OFF, Y_OFF - 0.0000, -math.pi / 2),
     31: (1.940 + X_OFF, Y_OFF - 3.6645,  math.pi / 2),
@@ -71,16 +71,20 @@ SIGMA_BEARING = math.radians(2.5)
 SIGMA_HEADING_BASE  = math.radians(8.0)   # heading desde gamma: sigma de cerca
 SIGMA_HEADING_SLOPE = math.radians(10.0)  # + rad de sigma por metro (lejos pesa menos)
 BEARING_SIGN  = -1.0          # yaw_deg(+)=marcador a la derecha -> bearing(-)
-GATE_CHI2_1D  = 3.84          # gate heading (1 GL, 99%)
-GATE_CHI2_2D  = 5.99          # gate rango-bearing (2 GL, 99%)
+GATE_CHI2_1D  = 4.61          # gate heading (1 GL, 99%)
+GATE_CHI2_2D  = 5.99           # gate rango-bearing (2 GL, 99%)
 MAX_USE_RANGE = 4.0
-HEADING_MAX_RANGE = 2       # arriba de esto ni se usa el gamma para heading
-INIT_MAX_RANGE    = 1       # init confiable solo con marcadores asi de cerca
-BEARING_MAX_DEG = 35.0  # ignorar marcadores fuera de ±35° del centro
+HEADING_MAX_RANGE = 3.0       # arriba de esto ni se usa el gamma para heading
+INIT_MAX_RANGE    = 1.5 
+MAX_INNOV_THETA = math.radians(25.0)
+
+# Nuevas constantes
+W_TURN_THRESH    = 0.05   # rad/s — si |ω| > esto, "está girando"
+BEARING_ROT_SCALE = 3.0   # multiplicador de σ_bearing por rad/s de ω
 
 # re-localizacion (recuperarse si el filtro se pierde)
 RELOC_STD_M  = 1.0            # si la incertidumbre de posicion supera esto -> relocaliza
-RELOC_STREAK = 15             # ciclos seguidos con marcador visible pero todo rechazado
+RELOC_STREAK = 20             # ciclos seguidos con marcador visible pero todo rechazado
 
 
 def wrap_angle(a):
@@ -96,6 +100,8 @@ class EKF:
         self.x = np.zeros(3)
         self.P = np.diag([1.0, 1.0, 1.0])
         self.initialized = False
+        self.cur_v = 0.0
+        self.cur_w = 0.0
 
     def init_pose(self, x, y, th, pos_sigma=0.10, th_sigma=math.radians(15)):
         self.x = np.array([x, y, th], dtype=float)
@@ -149,7 +155,8 @@ class EKF:
             [-dx / r, -dy / r,  L * (dx * s - dy * c) / r],
             [ dy / q, -dx / q, -L * (dx * c + dy * s) / q - 1.0],
         ])
-        R = np.diag([sigma_r ** 2, SIGMA_BEARING ** 2])
+        sigma_b_eff = SIGMA_BEARING * (1.0 + BEARING_ROT_SCALE * abs(self.cur_w))
+        R = np.diag([sigma_r ** 2, sigma_b_eff ** 2])
         innov = np.array([z_r - z_hat[0], wrap_angle(z_b - z_hat[1])])
         S = H @ self.P @ H.T + R
         Sinv = np.linalg.inv(S)
@@ -170,6 +177,8 @@ class EKF:
         H = np.array([[0.0, 0.0, 1.0]])
         R = np.array([[sigma_th ** 2]])
         innov = np.array([wrap_angle(z_th - self.x[2])])
+        if abs(innov[0]) > MAX_INNOV_THETA:
+            return False 
         S = H @ self.P @ H.T + R
         Sinv = np.linalg.inv(S)
         if float(innov @ Sinv @ innov) > GATE_CHI2_1D:
@@ -209,8 +218,6 @@ class PoseKalmanNode(Node):
 
         self.ekf = EKF()
         self.odo = np.zeros(3)
-        self.cur_v = 0.0
-        self.cur_w = 0.0
         self.reject_streak = 0
         self._dr_dist = 0.0      # dead-reckoning acumulado (para calibrar escala)
         self._dr_rot = 0.0
@@ -269,6 +276,24 @@ class PoseKalmanNode(Node):
                and 0.05 < rng <= MAX_USE_RANGE:
                 out.append(d)
         return out
+    
+    def _reinit_position_only(self, dets):
+        """Re-inicializa solo xy, conserva el heading actual."""
+        if not dets or not self.ekf.initialized:
+            return
+        d = dets[0]
+        mx, my, m_yaw = ARUCO_MAP[d['id']]
+        rng = d['distance_m']
+        z_b = BEARING_SIGN * math.radians(d['yaw_deg'])
+        th = self.ekf.x[2]   # heading actual del filtro
+        world_dir = th + z_b
+        cx = mx - rng * math.cos(world_dir)
+        cy = my - rng * math.sin(world_dir)
+        x0 = cx - CAM_FORWARD * math.cos(th)
+        y0 = cy - CAM_FORWARD * math.sin(th)
+        self.ekf.x[0], self.ekf.x[1] = x0, y0
+        self.ekf.P[0,0] = self.ekf.P[1,1] = 0.25**2
+        self.get_logger().info(f'Posición re-inicializada: x={x0:.3f} y={y0:.3f}')
 
     def try_init(self, dets):
         # pose completa del/los marcador(es), sin suponer heading.
@@ -276,8 +301,17 @@ class PoseKalmanNode(Node):
         # inicializa igual pero con mucha incertidumbre para que se corrija al
         # moverse, en vez de comprometerse a un gamma lejano (que sale mal).
         ds = sorted(dets, key=lambda d: d['distance_m'])
-        close = [d for d in ds if d['distance_m'] <= INIT_MAX_RANGE]
-        use = close if close else ds[:1]
+        close = [d for d in ds if d['distance_m'] <= INIT_MAX_RANGE 
+                and d.get('gamma_reliable', False)]   # ← solo gamma confiable
+        use = close if close else []
+        
+        if not use:
+            # Sin gamma confiable cercano: solo corregir posición con range-bearing,
+            # dejar el heading que tiene el filtro (no reinicializar heading)
+            self.get_logger().warn(
+                'Re-localización sin gamma confiable — solo posición, heading conservado')
+            self._reinit_position_only(ds[:1])
+            return
         confident = bool(close)
         xs, ys, ss, cc = [], [], [], []
         for d in use:
@@ -309,6 +343,7 @@ class PoseKalmanNode(Node):
             f'x={x0:.3f} y={y0:.3f} th={math.degrees(th0):.1f}deg')
 
     def correct_step(self, dets):
+        dets = sorted(dets, key=lambda d: d['distance_m'])[:1]
         accepted = 0
         for d in dets:
             mid = d['id']
@@ -319,15 +354,13 @@ class PoseKalmanNode(Node):
                 sigma_r = SIGMA_R_FLOOR
             sigma_r = max(float(sigma_r), SIGMA_R_FLOOR)   # piso
             mx, my, m_yaw = ARUCO_MAP[mid]
-            # En correct_step, antes de update_landmark:
-            z_b = BEARING_SIGN * math.radians(d['yaw_deg'])
-            if abs(math.degrees(z_b)) > BEARING_MAX_DEG:
-                continue  # marcador muy de lado, fisheye lo distorsiona
+
             if self.ekf.update_landmark(mx, my, rng, z_b, sigma_r):
                 accepted += 1
             # heading desde la orientacion del marcador, solo si es confiable
             gamma = d.get('gamma_deg')
-            if gamma is not None and rng <= HEADING_MAX_RANGE:
+            gamma_ok = d.get('gamma_reliable', False)
+            if gamma is not None and gamma_ok and rng <= HEADING_MAX_RANGE and abs(self.cur_w) < W_TURN_THRESH:
                 z_th = wrap_angle(m_yaw + math.radians(gamma))
                 sigma_th = SIGMA_HEADING_BASE + SIGMA_HEADING_SLOPE * rng
                 self.ekf.update_heading(z_th, sigma_th)

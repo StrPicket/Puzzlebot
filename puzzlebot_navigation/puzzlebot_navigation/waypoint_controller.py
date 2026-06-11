@@ -43,7 +43,7 @@ KV_W      = 0.02    # amortiguación velocidad angular (usa w_robot de odom)
 
 # Límites de velocidad
 V_MAX     = 0.15    # m/s
-OMEGA_MAX = 0.15    # rad/s
+OMEGA_MAX = 0.1    # rad/s
 
 # Tolerancias
 GOAL_DIST_TOL  = 0.15   # m — radio para considerar waypoint alcanzado

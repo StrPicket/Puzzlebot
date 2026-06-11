@@ -31,9 +31,6 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
-# ── calibracion REAL (23 imgs, RMS 0.834 px @ 1280x720) ────────────
-# fx,fy subidos ~4% (x1.04) tras verificar distancias: el tablero no media
-# exactamente 3.0cm, lo que dejaba fx ~4% bajo (distancias ~5% cortas).
 CAMERA_MATRIX = np.array([
     [1.03795641e+03,   0.0,         6.36200746e+02],
     [  0.0,         1.03634881e+03,  3.81386102e+02],
@@ -265,6 +262,7 @@ class ArucoDetector(Node):
             'size_px':       round(size_px, 2),
             'reproj_err':    round(reproj_err, 4),
             '_rvec': rvec, '_tvec': tvec, '_pts': img_pts,
+            'gamma_reliable': self._gamma_confidence(rvecs, errs, order, n),
         }
 
 
@@ -272,6 +270,17 @@ class ArucoDetector(Node):
         R, _ = cv2.Rodrigues(rvec)
         wrapped = (np.arctan2(R[0, 2], R[2, 2]) + math.pi) % (2 * math.pi) - math.pi
         return float(np.degrees(wrapped))
+    
+    def _gamma_confidence(self, rvecs, errs, order, n):
+        """Retorna True si el gamma de la solución primaria es confiable."""
+        # Si solo hay una solución, no hay ambigüedad que resolver
+        if n < 2:
+            return True
+        # Si las dos soluciones tienen error similar, gamma es ambiguo → no confiar
+        err_ratio = float(errs[order[1]]) / (float(errs[order[0]]) + 1e-6)
+        if err_ratio < 1.5:   # las dos soluciones son casi igual de buenas
+            return False
+        return True
 
     def _size_px(self, img_pts):
         right = np.linalg.norm(img_pts[2] - img_pts[1])
